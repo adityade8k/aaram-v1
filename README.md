@@ -48,6 +48,11 @@ The app connects the user, AI services, and robot hardware:
 
 ## Installation
 
+This Aaram checkout pins the Reachy Mini SDK to `1.12.0rc1`, matching the
+Reachy desktop app's robot service used for this prototype. Keep both versions
+aligned when updating the robot service. After updating this checkout, activate
+the environment and run `uv sync --frozen` before restarting the conversation app.
+
 > [!IMPORTANT]
 > Install [Reachy Mini's SDK](https://github.com/pollen-robotics/reachy_mini/) before using this app.<br>
 > Windows support is currently experimental and has not been extensively tested. Use with caution.
@@ -110,10 +115,110 @@ Copy `.env.example` to `.env` when you want to point Hugging Face at your own lo
 | `REACHY_MINI_INSTANCE_PATH` | Directory for this instance's data: long-term memory, user personalities and settings. Defaults to `conversation_app` beside the daemon's own config (`~/.config/reachy_mini` on Linux). Data written by an older version inside the installed package is copied over once. |
 | `REACHY_MINI_MEMORY_ENABLED` | Long-term memory. When `false`, remembered facts stay on disk but are not injected into the prompt, and the `remember` / `forget` tools decline. Defaults to `true`. |
 | `REACHY_MINI_CAMERA_ENABLED` | Camera tool. `--no-camera` forces it off regardless. Defaults to `true`. |
+| `REACHY_MINI_GROUNDING_FILE` | Optional UTF-8 document added to every conversational session's instructions. Relative paths resolve from the project root; absolute paths are also supported. |
 
 These variables are the starting value. What you change through the settings UI
 (or from the mobile app) is written to `settings.json` in the instance directory
 and wins over them, so a toggle always does what it says.
+
+### Ari's shop context
+
+The local `.env` selects `docs/Grounding Doc/ari-01-shop-context.md` with:
+
+```env
+REACHY_MINI_GROUNDING_FILE="docs/Grounding Doc/ari-01-shop-context.md"
+```
+
+The full document is included in the instructions sent to the Hugging Face
+conversation service. It supplies Ari's identity, shop context and staff-approval
+rules alongside the selected personality and memory. Shop context takes priority
+over conflicting personality text or remembered facts.
+
+Edit that document, then stop and restart the conversation app to apply changes.
+The file is also reread whenever session instructions are refreshed. A configured
+file that is missing, unreadable or empty prevents an ungrounded session from
+starting and produces an error naming the file. Unset the variable to disable it.
+For a wheel-only installation, provide an absolute path to your own document.
+
+### Ari's background reasoning
+
+Ari's existing Hugging Face conversation model handles hearing and speaking. An
+optional OpenAI advisor receives finished user and assistant transcripts while
+that conversation continues. It uses both the shop context above and
+`docs/Grounding Doc/ari-02-tutor-principles.md`. The tutor document is the place to
+edit the reasoning model's teaching approach and add broader reference context.
+
+```text
+Reachy mic → Hugging Face conversation model → Reachy speaker
+                  │ finished transcripts           ↑
+                  └→ OpenAI reasoning → short advisory notes
+```
+
+The general architecture image above does not yet include this optional advisor.
+
+To enable it:
+
+1. Set up [OpenAI API billing](https://platform.openai.com/settings/organization/billing/overview)
+   and create an [API key](https://platform.openai.com/api-keys).
+   [ChatGPT Pro and API usage have separate billing](https://help.openai.com/en/articles/9039756-managing-billing-for-chatgpt-and-the-api-platform).
+2. Edit the local `.env` (ignored by Git):
+   ```env
+   OPENAI_API_KEY=your-api-key
+   REACHY_MINI_REASONING_ENABLED=true
+   REACHY_MINI_REASONING_MODEL=gpt-6-astra
+   REACHY_MINI_REASONING_EFFORT=medium
+   REACHY_MINI_REASONING_GROUNDING_FILE="docs/Grounding Doc/ari-02-tutor-principles.md"
+   ```
+3. Restart the app from this folder:
+   ```bash
+   source .venv/bin/activate
+   reachy-mini-conversation-app --no-camera
+   ```
+4. Ask a shop question, then keep talking. Logs show `Background reasoning
+   started`, `Background reasoning ready`, and `Background reasoning context sent
+   to conversation model`. These report the handoff, not a guarantee the voice
+   model will use every note. Try: “My test cut did not go all the way through.”
+   Supply the material and what you observed when Ari asks. The advisor should
+   suggest a useful diagnostic question, acknowledge missing facts, and defer
+   machine settings and approval to staff.
+
+Set `REACHY_MINI_REASONING_MODEL` and `REACHY_MINI_REASONING_EFFORT` in `.env`,
+then restart the app. Defaults are `gpt-6-astra` and `medium`. The chosen model
+must support the Responses API, structured outputs, and the selected effort.
+[GPT-6 Astra supports](https://developers.openai.com/api/docs/models/gpt-6-astra)
+`low`, `medium`, `high`, `xhigh`, and `max`. Higher effort can take longer and use
+more tokens; it does not increase this app's timeout or output-token cap below.
+The app also accepts `none` and `minimal` for models that support those values.
+Blank or invalid effort settings fall back to `medium`; invalid values log a warning.
+Startup logs show the chosen model and effort. No extra package or voice model is required.
+
+The worker batches updates for 0.75 seconds, runs one request at a time, and starts
+requests at least 5 seconds apart. Updates arriving during inference are combined
+into the next request. It sends up to 24 recent utterances and 24,000 transcript
+characters (up to 4,000 per utterance); older conversation is not retained by this
+worker. Requests have a 45-second timeout and a 3,000-token output cap including
+reasoning tokens. Each completed user or assistant utterance can cause another
+request, so API costs accumulate during conversation. Failures wait at least 15
+seconds before another pending update is processed.
+
+Results overtaken by a newer user utterance are discarded. A delivered note is
+labeled with its source question and remains available for the next user turn;
+Ari is instructed to ignore it if the topic has changed. It expires after another
+user turn or is replaced by new advice. Current notes update the conversation
+instructions without forcing a new reply, interrupting speech, or changing Ari's
+personality. They take effect on a subsequent model response; speech already
+being generated cannot be changed. The fast model keeps helping and clarifying
+while the advisor runs. Missing keys, unreadable tutor documents, timeouts, or API
+errors leave the voice conversation available and produce a warning.
+
+Enabling this sends text transcripts and both grounding documents to OpenAI;
+returned advisory notes are sent to the Hugging Face conversation service.
+The worker sends no microphone audio or camera images to OpenAI, uses
+`store=False`, and keeps its transcript window in memory. This setting is not a
+promise of zero provider retention. It neither browses nor executes robot tools;
+text in the tutor document alone does not implement camera controls or a silence
+timer. Restart after editing the tutor document. Set
+`REACHY_MINI_REASONING_ENABLED=false` and restart to disable the advisor.
 
 ### Hugging Face Connection Modes
 

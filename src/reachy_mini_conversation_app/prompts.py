@@ -3,7 +3,7 @@
 import logging
 from pathlib import Path
 
-from reachy_mini_conversation_app.config import config, get_default_voice
+from reachy_mini_conversation_app.config import PROJECT_ROOT, config, get_default_voice
 from reachy_mini_conversation_app.memory import format_memory_for_prompt
 from reachy_mini_conversation_app.profile_store import (
     DEFAULT_PROFILE_NAME,
@@ -26,8 +26,23 @@ def _active_profile() -> ProfileDefinition:
     return read_profile(config.REACHY_MINI_CUSTOM_PROFILE)
 
 
+def read_grounding_document(filename: str, setting: str) -> str:
+    """Read a nonempty UTF-8 grounding file relative to the project root."""
+    path = Path(filename).expanduser()
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    try:
+        grounding = path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError) as exc:
+        raise RuntimeError(f"Cannot read {setting} at {path}: {exc}") from exc
+    if not grounding:
+        raise RuntimeError(f"{setting} is empty: {path}")
+    logger.info("Loaded %s from %s (%d characters)", setting, path, len(grounding))
+    return grounding
+
+
 def get_session_instructions(instance_path: str | Path | None = None) -> str:
-    """Return instructions for the active profile with memory context."""
+    """Return active profile instructions with local grounding and memory context."""
     selected_profile = config.REACHY_MINI_CUSTOM_PROFILE
     profile_name = selected_profile or DEFAULT_PROFILE_NAME
     try:
@@ -45,6 +60,17 @@ def get_session_instructions(instance_path: str | Path | None = None) -> str:
             raise RuntimeError("Default profile has no usable instructions") from exc
     if not instructions:
         raise RuntimeError("Default profile has no usable instructions")
+
+    if config.GROUNDING_FILE:
+        grounding = read_grounding_document(config.GROUNDING_FILE, "REACHY_MINI_GROUNDING_FILE")
+        instructions += (
+            "\n\n## LOCAL GROUNDING CONTEXT\n"
+            "Use the following document for your identity, location, local facts, and shop rules. "
+            "It takes precedence over conflicting personality text or remembered facts. "
+            "Do not invent missing shop information or infer staff approval from this document; "
+            "refer uncertain shop questions to staff.\n\n"
+            f"{grounding}"
+        )
 
     memory_prompt = format_memory_for_prompt(instance_path)
     if memory_prompt:

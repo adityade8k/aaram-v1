@@ -8,6 +8,22 @@ import pytest
 from reachy_mini_conversation_app import config
 
 
+@pytest.mark.parametrize("value, expected", [(None, None), ("  ", None), (" shop.md ", "shop.md")])
+def test_grounding_environment_reload(
+    monkeypatch: pytest.MonkeyPatch, value: str | None, expected: str | None
+) -> None:
+    """Reloading an instance environment can select or disable its grounding document."""
+    monkeypatch.setattr(config.config, "GROUNDING_FILE", "old.md")
+    if value is None:
+        monkeypatch.delenv(config.GROUNDING_FILE_ENV, raising=False)
+    else:
+        monkeypatch.setenv(config.GROUNDING_FILE_ENV, value)
+
+    config.refresh_runtime_config_from_env()
+
+    assert config.config.GROUNDING_FILE == expected
+
+
 @pytest.mark.parametrize(
     "raw_value, expected",
     [

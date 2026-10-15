@@ -4,6 +4,7 @@ import base64
 import asyncio
 from types import SimpleNamespace
 from typing import Any
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import numpy as np
@@ -14,6 +15,7 @@ import reachy_mini_conversation_app.huggingface_realtime as hf_mod
 from reachy_mini_conversation_app.config import config, get_default_voice, refresh_runtime_config_from_env
 from reachy_mini_conversation_app.streaming import AdditionalOutputs
 from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
+from reachy_mini_conversation_app.background_reasoning import ReasoningAdvice, BackgroundReasoner
 from reachy_mini_conversation_app.huggingface_realtime import HuggingFaceRealtimeHandler
 from reachy_mini_conversation_app.tools.background_tool_manager import ToolState, ToolNotification
 
@@ -148,6 +150,30 @@ def _plain_handler() -> HuggingFaceRealtimeHandler:
     return HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
 
 
+@pytest.mark.asyncio
+async def test_shop_document_is_sent_in_conversational_session_instructions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The realtime session sends the full configured shop document to its backend."""
+    document = Path(__file__).parents[1] / "docs" / "Grounding Doc" / "ari-01-shop-context.md"
+    monkeypatch.setattr(config, "GROUNDING_FILE", str(document))
+    monkeypatch.setattr(config, "REACHY_MINI_CUSTOM_PROFILE", None)
+    monkeypatch.setattr(config, "MEMORY_ENABLED", False)
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    monkeypatch.setattr(hf_mod, "get_session_greeting_prompt", lambda: "")
+    captured_update: dict[str, object] = {}
+    handler = _plain_handler()
+    handler.client = _make_fake_realtime_client(captured_update=captured_update)
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+
+    await handler._run_realtime_session()
+
+    session = captured_update["session"]
+    assert isinstance(session, dict)
+    assert document.read_text(encoding="utf-8").strip() in session["instructions"]
+
+
 def _session_handler(monkeypatch: Any, events: tuple[_FakeEvent, ...]) -> HuggingFaceRealtimeHandler:
     """Build a handler wired to a fake realtime client yielding `events`, ready to run a session."""
     monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
@@ -170,6 +196,75 @@ def _drain(handler: HuggingFaceRealtimeHandler) -> list[Any]:
 
 def _messages(items: list[Any]) -> list[dict[str, Any]]:
     return [item.args[0] for item in items if isinstance(item, AdditionalOutputs)]
+
+
+@pytest.mark.asyncio
+async def test_audio_continues_during_reasoning_and_advice_updates_live_instructions(monkeypatch) -> None:
+    """A slow advisor leaves speech flowing and later augments the live personality and grounding."""
+    handler = _session_handler(monkeypatch, ())
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "PERSONALITY + SHOP")
+    inference_started = asyncio.Event()
+    release_inference = asyncio.Event()
+    advice_sent = asyncio.Event()
+    captured_sessions = []
+    advisor_client = MagicMock()
+    advisor_client.close = AsyncMock()
+    advice = ReasoningAdvice(snippets=["SPECIALIZED NOTE"], next_question="Which material?", uncertainty="")
+
+    async def infer(**kwargs):
+        inference_started.set()
+        await release_inference.wait()
+        return SimpleNamespace(status="completed", output_parsed=advice)
+
+    advisor_client.responses.parse = AsyncMock(side_effect=infer)
+
+    def reasoner_factory(publish):
+        return BackgroundReasoner(
+            advisor_client, "tutor", "model", publish, debounce_seconds=0, min_interval_seconds=5
+        )
+
+    monkeypatch.setattr(hf_mod, "create_background_reasoner", reasoner_factory)
+    conn = MagicMock()
+    conn.__aenter__ = AsyncMock(return_value=conn)
+    conn.__aexit__ = AsyncMock(return_value=False)
+    conn.response.create = AsyncMock()
+
+    async def update(*, session):
+        captured_sessions.append(session)
+        if "SPECIALIZED NOTE" in session.get("instructions", ""):
+            advice_sent.set()
+
+    conn.session.update = AsyncMock(side_effect=update)
+    pcm = np.array([10, 20, 30], dtype=np.int16)
+
+    async def events():
+        yield _FakeEvent("conversation.item.input_audio_transcription.completed", transcript="My cut failed.")
+        await asyncio.wait_for(inference_started.wait(), 1)
+        yield _FakeEvent("response.created")
+        yield _FakeEvent("response.output_audio.delta", delta=base64.b64encode(pcm.tobytes()).decode())
+        yield _FakeEvent("response.output_audio_transcript.done", transcript="Tell me what happened.")
+        emitted = _drain(handler)
+        frames = [item for item in emitted if isinstance(item, tuple)]
+        assert len(frames) == 1
+        np.testing.assert_array_equal(frames[0][1], pcm.reshape(1, -1))
+        assert {message["role"] for message in _messages(emitted)} == {"user", "assistant"}
+        assert not advice_sent.is_set()
+        release_inference.set()
+        await asyncio.wait_for(advice_sent.wait(), 1)
+        assert "PERSONALITY + SHOP" in captured_sessions[-1]["instructions"]
+        assert "SPECIALIZED NOTE" in captured_sessions[-1]["instructions"]
+        conn.response.create.assert_not_awaited()
+        yield _FakeEvent("response.done")
+        # A memory refresh must retain the current advisor note.
+        await handler.refresh_instructions()
+        assert "SPECIALIZED NOTE" in captured_sessions[-1]["instructions"]
+
+    conn.__aiter__.side_effect = events
+    handler.client = MagicMock()
+    handler.client.realtime.connect.return_value = conn
+    await handler._run_realtime_session()
+    advisor_client.close.assert_awaited_once()
+    assert handler._reasoner is None
 
 
 @pytest.mark.asyncio

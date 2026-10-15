@@ -48,6 +48,7 @@ from reachy_mini_conversation_app.tools.core_tools import (
     ToolDependencies,
     get_tool_specs,
 )
+from reachy_mini_conversation_app.background_reasoning import BackgroundReasoner, create_background_reasoner
 from reachy_mini_conversation_app.conversation_handler import ConversationHandler
 from reachy_mini_conversation_app.tools.background_tool_manager import (
     ToolCallRoutine,
@@ -135,6 +136,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self.output_queue: "asyncio.Queue[Tuple[int, NDArray[np.int16]] | AdditionalOutputs]" = asyncio.Queue()
 
         self.instance_path = instance_path
+        self._reasoner: BackgroundReasoner | None = None
         self._voice_override: str | None = self._normalize_startup_voice(startup_voice)
         self._realtime_connect_query: dict[str, str] = {}
 
@@ -219,11 +221,17 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             )
         return fallback
 
+    def _get_live_instructions(self) -> str:
+        instructions = get_session_instructions(self.instance_path)
+        if self._reasoner is not None:
+            instructions += self._reasoner.conversation_context
+        return instructions
+
     def _get_session_config(self, tool_specs: list[ToolSpec]) -> RealtimeSessionCreateRequestParam:
         """Return the Hugging Face OpenAI-compatible session config."""
         return RealtimeSessionCreateRequestParam(
             type="realtime",
-            instructions=get_session_instructions(self.instance_path),
+            instructions=self._get_live_instructions(),
             audio=RealtimeAudioConfigParam(
                 input=RealtimeAudioConfigInputParam(
                     # The OpenAI SDK type only includes 24 kHz PCM, but the HF
@@ -298,7 +306,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         await self.connection.session.update(
             session=RealtimeSessionCreateRequestParam(
                 type="realtime",
-                instructions=get_session_instructions(self.instance_path),
+                instructions=self._get_live_instructions(),
             ),
         )
         logger.info("Refreshed session instructions")
@@ -309,7 +317,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         previous_profile = config.REACHY_MINI_CUSTOM_PROFILE
         set_custom_profile(profile)
         try:
-            instructions = get_session_instructions(self.instance_path)
+            instructions = self._get_live_instructions()
             voice = self.get_current_voice()
             core_tools.initialize_tools(force=True)
         except Exception as exc:
@@ -748,6 +756,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
             response_sender_task: asyncio.Task[None] | None = None
             try:
+                self._reasoner = create_background_reasoner(self.refresh_instructions)
+                if self._reasoner is not None:
+                    await self.refresh_instructions()
+
                 # Start the background tool manager
                 self.tool_manager.start_up(tool_callbacks=[self._handle_tool_result])
 
@@ -843,6 +855,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                         await self.output_queue.put(AdditionalOutputs({"role": "user", "content": transcript}))
                         self._emit_transcript("user", transcript, True)
+                        if self._reasoner is not None:
+                            self._reasoner.observe("user", transcript)
 
                     # Handle assistant transcription
                     if event.type == "response.output_audio_transcript.done":
@@ -852,6 +866,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             AdditionalOutputs({"role": "assistant", "content": event.transcript})
                         )
                         self._emit_transcript("assistant", event.transcript or "", True)
+                        if self._reasoner is not None:
+                            self._reasoner.observe("assistant", event.transcript or "")
 
                     # Handle audio delta
                     if event.type == "response.output_audio.delta":
@@ -948,6 +964,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                                 AdditionalOutputs({"role": "assistant", "content": f"[error] {msg}"})
                             )
             finally:
+                if self._reasoner is not None:
+                    await self._reasoner.close()
+                    self._reasoner = None
+
                 # Stop the response sender worker.
                 if response_sender_task is not None:
                     response_sender_task.cancel()
@@ -1001,6 +1021,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         """Shutdown the handler."""
         # Unblock the response sender worker so it can exit
         self._response_done_event.set()
+
+        if self._reasoner is not None:
+            await self._reasoner.close()
+            self._reasoner = None
 
         # Stop background tool manager tasks (listener + cleanup)
         await self.tool_manager.shutdown()

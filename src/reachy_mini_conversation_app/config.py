@@ -68,6 +68,13 @@ HF_REALTIME_WS_URL_ENV = "HF_REALTIME_WS_URL"
 REALTIME_TRANSCRIPTION_LANGUAGE_ENV = "REALTIME_TRANSCRIPTION_LANGUAGE"
 MEMORY_ENABLED_ENV = "REACHY_MINI_MEMORY_ENABLED"
 CAMERA_ENABLED_ENV = "REACHY_MINI_CAMERA_ENABLED"
+GROUNDING_FILE_ENV = "REACHY_MINI_GROUNDING_FILE"
+REASONING_ENABLED_ENV = "REACHY_MINI_REASONING_ENABLED"
+REASONING_MODEL_ENV = "REACHY_MINI_REASONING_MODEL"
+REASONING_EFFORT_ENV = "REACHY_MINI_REASONING_EFFORT"
+REASONING_GROUNDING_FILE_ENV = "REACHY_MINI_REASONING_GROUNDING_FILE"
+DEFAULT_REASONING_MODEL = "gpt-6-astra"
+DEFAULT_REASONING_GROUNDING_FILE = "docs/Grounding Doc/ari-02-tutor-principles.md"
 INSTANCE_PATH_ENV = "REACHY_MINI_INSTANCE_PATH"
 HF_LOCAL_CONNECTION_MODE = "local"
 HF_DEPLOYED_CONNECTION_MODE = "deployed"
@@ -141,6 +148,17 @@ def resolve_app_timeout_minutes() -> float | None:
         logger.warning("Ignoring invalid %s=%r; using default.", APP_TIMEOUT_MINUTES_ENV, raw_value)
         return DEFAULT_APP_TIMEOUT_MINUTES
     return timeout_minutes if timeout_minutes > 0 else None
+
+
+def normalize_reasoning_effort(value: str | None) -> str:
+    """Normalize a reasoning effort setting, falling back to medium for invalid values."""
+    effort = (value or "").strip().lower()
+    if not effort:
+        return "medium"
+    if effort in {"none", "minimal", "low", "medium", "high", "xhigh", "max"}:
+        return effort
+    logger.warning("Invalid %s=%r; using medium", REASONING_EFFORT_ENV, value)
+    return "medium"
 
 
 def normalize_hf_connection_mode(value: str | None) -> str | None:
@@ -324,6 +342,13 @@ class Config:
     REALTIME_TRANSCRIPTION_LANGUAGE = normalize_transcription_language(os.getenv(REALTIME_TRANSCRIPTION_LANGUAGE_ENV))
     MEMORY_ENABLED = _env_flag(MEMORY_ENABLED_ENV, default=True)
     CAMERA_ENABLED = _env_flag(CAMERA_ENABLED_ENV, default=True)
+    GROUNDING_FILE = (os.getenv(GROUNDING_FILE_ENV) or "").strip() or None
+    REASONING_ENABLED = _env_flag(REASONING_ENABLED_ENV)
+    REASONING_MODEL = (os.getenv(REASONING_MODEL_ENV) or "").strip() or DEFAULT_REASONING_MODEL
+    REASONING_EFFORT = normalize_reasoning_effort(os.getenv(REASONING_EFFORT_ENV))
+    REASONING_GROUNDING_FILE = (
+        os.getenv(REASONING_GROUNDING_FILE_ENV) or ""
+    ).strip() or DEFAULT_REASONING_GROUNDING_FILE
     HF_TOKEN = os.getenv("HF_TOKEN")  # Optional, falls back to hf auth login if not set
 
     logger.debug(
@@ -440,6 +465,13 @@ def refresh_runtime_config_from_env() -> None:
     config.REACHY_MINI_CUSTOM_PROFILE = LOCKED_PROFILE or os.getenv("REACHY_MINI_CUSTOM_PROFILE")
     config.MEMORY_ENABLED = _env_flag(MEMORY_ENABLED_ENV, default=True)
     config.CAMERA_ENABLED = _env_flag(CAMERA_ENABLED_ENV, default=True)
+    config.GROUNDING_FILE = (os.getenv(GROUNDING_FILE_ENV) or "").strip() or None
+    config.REASONING_ENABLED = _env_flag(REASONING_ENABLED_ENV)
+    config.REASONING_MODEL = (os.getenv(REASONING_MODEL_ENV) or "").strip() or DEFAULT_REASONING_MODEL
+    config.REASONING_EFFORT = normalize_reasoning_effort(os.getenv(REASONING_EFFORT_ENV))
+    config.REASONING_GROUNDING_FILE = (
+        os.getenv(REASONING_GROUNDING_FILE_ENV) or ""
+    ).strip() or DEFAULT_REASONING_GROUNDING_FILE
 
 
 # Files the app writes into its instance directory, migrated once when the

@@ -24,7 +24,7 @@ dependencies = [
 
     #Reachy mini
     "reachy_mini_dances_library",
-    "reachy-mini>=1.10.0rc5",
+    "reachy-mini==1.12.0rc1",
     "mcp>=2.0,<3",
     "mcp-types>=2.0,<3",
     "httpx2>=2.5.0",
@@ -50,6 +50,13 @@ exclude-newer = "7 days"
 [tool.uv.exclude-newer-package]
 "reachy-mini" = false
 "reachy-mini-dances-library" = false
+
+# Resolve this Linux-only dependency on macOS without building its native libraries.
+[[tool.uv.dependency-metadata]]
+name = "pygobject"
+version = "3.46.0"
+requires-python = ">=3.8,<4"
+requires-dist = ["pycairo>=1.16.0"]
 
 [project.entry-points."reachy_mini_apps"]
 reachy_mini_conversation_app = "reachy_mini_conversation_app.main:ReachyMiniConversationApp"
