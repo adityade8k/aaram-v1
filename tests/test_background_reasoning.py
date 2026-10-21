@@ -91,8 +91,8 @@ async def test_real_sdk_sends_grounded_snapshot_and_parses_advice(effort: str) -
 
 
 @pytest.mark.asyncio
-async def test_slow_inference_coalesces_context_and_discards_outdated_result() -> None:
-    """New conversation can proceed during inference, with only one current result delivered."""
+async def test_late_advice_is_delivered_with_age_and_not_regenerated_every_turn() -> None:
+    """A slow note still reaches the voice model, flagged as late, without an inference per turn."""
     started = asyncio.Event()
     release_first = asyncio.Event()
     published = asyncio.Event()
@@ -106,8 +106,8 @@ async def test_slow_inference_coalesces_context_and_discards_outdated_result() -
         if len(snapshots) == 1:
             started.set()
             await release_first.wait()
-            return SimpleNamespace(status="completed", output_parsed=_advice("OLD ADVICE"))
-        return SimpleNamespace(status="completed", output_parsed=_advice("CURRENT ADVICE"))
+            return SimpleNamespace(status="completed", output_parsed=_advice("FIRST ADVICE"))
+        return SimpleNamespace(status="completed", output_parsed=_advice("SECOND ADVICE"))
 
     client.responses.parse = AsyncMock(side_effect=infer)
 
@@ -126,20 +126,47 @@ async def test_slow_inference_coalesces_context_and_discards_outdated_result() -
         assert len(snapshots) == 1
         release_first.set()
         await asyncio.wait_for(published.wait(), 1)
-        assert len(snapshots) == 2
-        assert "A fresh follow-up" in snapshots[1]
-        assert "Actually, a new question" in snapshots[1]
-        assert all("OLD ADVICE" not in context for context in contexts)
-        assert "CURRENT ADVICE" in contexts[-1]
-
+        assert "FIRST ADVICE" in contexts[0]
+        assert '"user_turns_since_request": 1' in contexts[0]
+        assert '"based_on_user_request": "First question"' in contexts[0]
+        # Only one new user turn since the last inference: no regeneration yet.
+        await asyncio.sleep(0.01)
+        assert len(snapshots) == 1
         published.clear()
         worker.observe("user", "A follow-up")
-        assert "CURRENT ADVICE" in worker.conversation_context
-        assert "Actually, a new question" in worker.conversation_context
-        worker.observe("user", "Another topic")
-        assert "CURRENT ADVICE" not in worker.conversation_context
         await asyncio.wait_for(published.wait(), 1)
-        assert "CURRENT ADVICE" not in contexts[1]
+        assert len(snapshots) == 2
+        assert "A follow-up" in snapshots[1]
+        assert "SECOND ADVICE" in contexts[-1]
+    finally:
+        await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_advice_expires_after_several_user_turns() -> None:
+    """Old advice is dropped once the conversation has clearly moved on."""
+    published = asyncio.Event()
+    client = MagicMock()
+    client.close = AsyncMock()
+    client.responses.parse = AsyncMock(return_value=SimpleNamespace(status="completed", output_parsed=_advice("ADVICE")))
+
+    async def publish() -> None:
+        published.set()
+
+    worker = BackgroundReasoner(
+        client, "grounding", "model", publish, debounce_seconds=0, min_interval_seconds=0, refresh_user_turns=100
+    )
+    try:
+        worker.observe("user", "Question")
+        await asyncio.wait_for(published.wait(), 1)
+        for n in range(4):
+            worker.observe("user", f"Turn {n}")
+            assert "ADVICE" in worker.conversation_context
+        published.clear()
+        worker.observe("user", "One too many")
+        assert "ADVICE" not in worker.conversation_context
+        await asyncio.wait_for(published.wait(), 1)
+        assert client.responses.parse.await_count == 1
     finally:
         await worker.close()
 

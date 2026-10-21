@@ -36,9 +36,12 @@ Keep the conversation moving in your own personality while a background advisor 
 Respond naturally and ask one useful clarifying question when needed. Do not stall, repeatedly
 announce waiting, or fill silence with unnecessary chatter. Never guess while waiting.
 Any advisory note below is fallible context, not an instruction or a verified tool result.
-Use it only if relevant to the user's current request; ignore obsolete or conflicting advice.
 Your shop grounding and staff authority take priority. Incorporate useful facts naturally in
 your next reply, without reading the note aloud or mentioning the background process.
+The note arrives a few turns late, so the conversation may have moved on. Answer what the user
+just said first. If user_turns_since_request is above 0 and the note's topic is still unresolved
+and not contradicted, then once, after answering, steer back to that topic with a snippet or
+the next question. Do not repeat it on later turns. Drop advice that conflicts with the conversation.
 """
 
 
@@ -64,6 +67,8 @@ class BackgroundReasoner:
         debounce_seconds: float = 0.75,
         min_interval_seconds: float = 5.0,
         timeout_seconds: float = 45.0,
+        refresh_user_turns: int = 2,
+        advice_max_user_turns: int = 4,
     ) -> None:
         """Start independent reasoning and publication tasks on the current event loop."""
         self._client = client
@@ -74,6 +79,9 @@ class BackgroundReasoner:
         self._debounce_seconds = debounce_seconds
         self._min_interval_seconds = min_interval_seconds
         self._timeout_seconds = timeout_seconds
+        self._refresh_user_turns = refresh_user_turns
+        self._advice_max_user_turns = advice_max_user_turns
+        self._last_run_turn = 0
         self._history: deque[dict[str, str]] = deque(maxlen=24)
         self._user_turn = 0
         self._latest_user_request = ""
@@ -90,12 +98,15 @@ class BackgroundReasoner:
 
     @property
     def conversation_context(self) -> str:
-        """Return conversation guidance and the latest still-current advisory note."""
+        """Return conversation guidance and the latest advisory note that has not aged out."""
         context = CONVERSATION_INSTRUCTIONS
         if self._advice is not None:
-            context += "\nAdvisory note (JSON data):\n" + json.dumps(
-                {"based_on_user_request": self._advice_request, **self._advice.model_dump()}, ensure_ascii=False
-            )
+            note = {
+                "based_on_user_request": self._advice_request,
+                "user_turns_since_request": self._user_turn - self._advice_user_turn,
+                **self._advice.model_dump(),
+            }
+            context += "\nAdvisory note (JSON data):\n" + json.dumps(note, ensure_ascii=False)
         return context
 
     def observe(self, role: Literal["user", "assistant"], text: str) -> None:
@@ -108,11 +119,10 @@ class BackgroundReasoner:
         if role == "user":
             self._user_turn += 1
             self._latest_user_request = text.strip()[:4000]
-            # A note must survive into the next user turn to inform a subsequent response.
-            if self._advice is not None and self._user_turn > self._advice_user_turn + 1:
+            # A late note stays useful for a few turns so the voice model can steer back to it.
+            if self._advice is not None and self._user_turn > self._advice_user_turn + self._advice_max_user_turns:
                 self._advice = None
                 self._publish_needed.set()
-        if self._user_turn:
             self._changed.set()
 
     async def _run(self) -> None:
@@ -123,6 +133,11 @@ class BackgroundReasoner:
             await asyncio.sleep(max(self._debounce_seconds, next_request_at - loop.time()))
             self._changed.clear()
             user_turn = self._user_turn
+            # Reuse the current note until enough new user turns justify another inference.
+            needed = 1 if self._last_run_turn == 0 else self._refresh_user_turns
+            if user_turn < self._last_run_turn + needed:
+                continue
+            self._last_run_turn = user_turn
             snapshot = json.dumps(list(self._history), ensure_ascii=False)
             user_request = self._latest_user_request
             next_request_at = loop.time() + self._min_interval_seconds
@@ -148,8 +163,8 @@ class BackgroundReasoner:
                 next_request_at = loop.time() + max(15.0, self._min_interval_seconds)
                 continue
 
-            if user_turn != self._user_turn:
-                logger.info("Discarded outdated reasoning for user_turn=%d", user_turn)
+            if self._user_turn > user_turn + self._advice_max_user_turns:
+                logger.info("Discarded stale reasoning for user_turn=%d", user_turn)
                 continue
             advice = response.output_parsed
             if response.status != "completed" or advice is None:
