@@ -126,6 +126,8 @@ export async function untilReady(requestFn, signal, onRetry) {
 }
 
 export const getStatus = () => rpcCall("conversation.status");
+export const getResearchStatus = () => rpcCall("conversation.research");
+export const experimentLog = (params = {}) => rpcCall("experiment.log", params);
 
 export const listPersonalities = () => rpcCall("personalities.list");
 export const loadPersonality = (name) => rpcCall("personalities.load", { name });

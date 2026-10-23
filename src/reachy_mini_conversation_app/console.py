@@ -550,6 +550,35 @@ class LocalStream:
         def _rpc_status(_params: dict[str, object]) -> dict[str, object]:
             return _status_payload()
 
+        def _rpc_research(_params: dict[str, object]) -> dict[str, object]:
+            return self.handler.research_status()
+
+        rpc.method("conversation.research")(_rpc_research)
+
+        async def _rpc_experiment_log(params: dict[str, object]) -> dict[str, object]:
+            action = params.get("action", "status")
+            if action not in ("status", "read", "clear"):
+                raise JsonRpcError("Unknown log action", reason="invalid_params", code=-32602)
+            if action == "clear" and params.get("confirm") is not True:
+                raise JsonRpcError("Clearing requires confirmation", reason="invalid_params", code=-32602)
+            offset, limit = params.get("offset", 0), params.get("limit", 0)
+            generation = params.get("generation", "")
+            if not isinstance(offset, int) or not isinstance(limit, int) or not isinstance(generation, str):
+                raise JsonRpcError("Invalid download range", reason="invalid_params", code=-32602)
+            try:
+                if action == "clear":
+                    return await self.handler.experiment_log.access("clear")
+                if action == "read":
+                    return await self.handler.experiment_log.access(
+                        "read", offset=offset, limit=limit, generation=generation
+                    )
+                return await self.handler.experiment_log.access("status")
+            except (OSError, ValueError) as exc:
+                logger.warning("Experiment log operation failed: %s", exc)
+                raise JsonRpcError(str(exc), reason="log_unavailable") from exc
+
+        rpc.register("experiment.log", _rpc_experiment_log)
+
         @rpc.method("conversation.say")  # type: ignore[untyped-decorator]
         async def _rpc_say(params: dict[str, object]) -> dict[str, object]:
             text = str(params.get("text", "")).strip()
@@ -864,6 +893,7 @@ class LocalStream:
         # Drain the handler's pending output in place — do NOT replace the
         # queue object, since emit() may be awaiting it (wait_for_item).
         self._drain_output_queue()
+        self.handler.playback_until = 0.0
 
     def _drain_output_queue(self) -> None:
         """Empty the handler's output queue in place without replacing it."""
@@ -908,7 +938,7 @@ class LocalStream:
                         )
 
             elif isinstance(handler_output, tuple):
-                _, audio_data = handler_output
+                sample_rate, audio_data = handler_output
 
                 # Skip empty audio frames
                 if audio_data.size == 0:
@@ -927,6 +957,9 @@ class LocalStream:
                 audio_frame = audio_to_float32(audio_data)
 
                 self._robot.media.push_audio_sample(audio_frame)
+                handler.playback_until = max(time.monotonic(), handler.playback_until) + (
+                    audio_frame.size / sample_rate
+                )
                 self._emit_level("assistant", audio_frame)
 
             else:

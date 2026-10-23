@@ -4,6 +4,8 @@ import os
 import sys
 from pathlib import Path
 
+import pytest
+
 
 PROJECT_ROOT = Path(__file__).parents[1].resolve()
 SRC_PATH = PROJECT_ROOT / "src"
@@ -23,3 +25,11 @@ os.environ.pop("REACHY_MINI_REASONING_ENABLED", None)
 os.environ.pop("REACHY_MINI_REASONING_MODEL", None)
 os.environ.pop("REACHY_MINI_REASONING_GROUNDING_FILE", None)
 os.environ.pop("REACHY_MINI_REASONING_EFFORT", None)
+
+os.environ.pop("REACHY_MINI_REASONING_WEB_SEARCH", None)
+
+
+@pytest.fixture(autouse=True)
+def isolate_experiment_storage(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Keep automatic experiment recording outside the user's real app data."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))

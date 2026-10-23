@@ -11,6 +11,7 @@ from numpy.typing import NDArray
 
 from reachy_mini_conversation_app.streaming import AdditionalOutputs, AsyncStreamHandler, wait_for_item
 from reachy_mini_conversation_app.idle_policy import start_idle_tool_call
+from reachy_mini_conversation_app.experiment_log import ExperimentLog
 from reachy_mini_conversation_app.tools.core_tools import ToolDependencies, get_tool_specs
 from reachy_mini_conversation_app.tools.background_tool_manager import BackgroundToolManager
 
@@ -31,16 +32,22 @@ class ConversationHandler(AsyncStreamHandler, ABC):
     deps: ToolDependencies
     tool_manager: BackgroundToolManager
     output_queue: asyncio.Queue[QueueItem]
+    playback_until: float = 0.0
     last_activity_time: float
     last_idle_behavior_time: float
     _activity_observer: Callable[[str], None] | None = None
     _transcript_observer: Callable[[str, str, bool], None] | None = None
 
-    def __init__(self) -> None:
+    def __init__(self, instance_path: str | None = None) -> None:
         """Initialize the stream handler and shared idle/activity tracking."""
         super().__init__()
+        self.experiment_log = ExperimentLog(instance_path)
         self.last_activity_time = time.monotonic()
         self.last_idle_behavior_time = self.last_activity_time
+
+    def research_status(self) -> dict[str, object]:
+        """Return research availability for clients without a background advisor."""
+        return {"status": "disabled", "snippets": [], "sources": []}
 
     def set_activity_observer(self, observer: Callable[[str], None] | None) -> None:
         """Attach or detach an activity observer. Pass None to clear."""

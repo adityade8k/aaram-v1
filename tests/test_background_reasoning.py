@@ -1,3 +1,4 @@
+import gzip
 import json
 import asyncio
 from types import SimpleNamespace
@@ -6,10 +7,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, BadRequestError
 
 import reachy_mini_conversation_app.background_reasoning as reasoning_mod
 from reachy_mini_conversation_app.config import config, refresh_runtime_config_from_env
+from reachy_mini_conversation_app.experiment_log import ExperimentLog
 from reachy_mini_conversation_app.background_reasoning import (
     ReasoningAdvice,
     BackgroundReasoner,
@@ -18,27 +20,44 @@ from reachy_mini_conversation_app.background_reasoning import (
 
 
 def _advice(snippet: str = "Ask which material was used.") -> ReasoningAdvice:
-    return ReasoningAdvice(
-        snippets=[snippet], next_question="What material did you use?", uncertainty="No settings known."
+    return ReasoningAdvice(snippets=[snippet], next_question="Which material?", uncertainty="No settings known.")
+
+
+def _client(advice=None):
+    client = MagicMock()
+    client.close = AsyncMock()
+    client.responses.parse = AsyncMock(
+        return_value=SimpleNamespace(status="completed", output_parsed=advice or _advice(), output=[])
     )
+    return client
 
 
-@pytest.mark.parametrize("effort", ["medium", "high", "max"])
+async def _wait_status(worker, status):
+    async with asyncio.timeout(2):
+        while worker.research_status["status"] != status:
+            await asyncio.sleep(0.001)
+
+
+@pytest.mark.parametrize(
+    "effort,web_search,search_required", [("medium", True, True), ("high", False, False), ("max", True, False)]
+)
 @pytest.mark.asyncio
-async def test_real_sdk_sends_grounded_snapshot_and_parses_advice(effort: str) -> None:
-    """Exercise actual SDK serialization and parsing without calling OpenAI."""
+async def test_sdk_sends_explicit_research_with_optional_search_and_preserves_citations(
+    effort, web_search, search_required
+):
+    """Research uses the real SDK wire format and retains attributable source links."""
     requests = []
     advice = _advice()
 
-    async def respond(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
+    async def respond(request):
+        requests.append(json.loads(request.content))
         return httpx.Response(
             200,
             json={
                 "id": "resp_test",
                 "object": "response",
                 "created_at": 0,
-                "model": "gpt-6-astra",
+                "model": "test-model",
                 "status": "completed",
                 "output": [
                     {
@@ -46,138 +65,195 @@ async def test_real_sdk_sends_grounded_snapshot_and_parses_advice(effort: str) -
                         "id": "msg_test",
                         "role": "assistant",
                         "status": "completed",
-                        "content": [{"type": "output_text", "text": advice.model_dump_json(), "annotations": []}],
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": advice.model_dump_json(),
+                                "annotations": [
+                                    {
+                                        "type": "url_citation",
+                                        "url": "https://www.epiloglaser.com/",
+                                        "title": "Manufacturer documentation",
+                                        "start_index": 0,
+                                        "end_index": 10,
+                                    },
+                                ],
+                            }
+                        ],
                     }
                 ],
             },
         )
 
     client = AsyncOpenAI(api_key="test-only", http_client=httpx.AsyncClient(transport=httpx.MockTransport(respond)))
-    published = asyncio.Event()
-    contexts = []
-
-    async def publish() -> None:
-        contexts.append(worker.conversation_context)
-        published.set()
-
+    publish = AsyncMock(return_value=True)
     worker = BackgroundReasoner(
         client,
         "Tutor and shop grounding",
-        "gpt-6-astra",
+        "test-model",
         publish,
         reasoning_effort=effort,
+        web_search=web_search,
         debounce_seconds=0,
         min_interval_seconds=0,
     )
     try:
         worker.observe("assistant", "Welcome!")
-        await asyncio.sleep(0)
-        assert not requests
         worker.observe("user", "My cut failed.")
-        await asyncio.wait_for(published.wait(), 1)
-        payload = json.loads(requests[0].content)
+        await asyncio.sleep(0.01)
+        assert not requests
+        reply = worker.request("Explain uneven cuts in the supplied material", search_required)
+        assert reply["status"] == "researching"
+        await _wait_status(worker, "ready")
+        payload = requests[0]
         assert payload["instructions"] == "Tutor and shop grounding"
         assert "My cut failed." in payload["input"]
         assert "Welcome!" in payload["input"]
+        assert "Explain uneven cuts" in payload["input"]
         assert payload["store"] is False
         assert payload["reasoning"] == {"effort": effort}
-        assert payload["model"] == "gpt-6-astra"
+        assert payload["tools"] == ([{"type": "web_search"}] if web_search else [])
+        assert payload["tool_choice"] == ("required" if search_required else "auto")
         assert payload["text"]["format"]["type"] == "json_schema"
-        assert payload["max_output_tokens"] == 3000
-        assert "Ask which material was used." in contexts[0]
+        assert payload["max_output_tokens"] == 6000
+        assert "Ask which material" in worker.conversation_context
+        assert worker.research_status["sources"] == [
+            {"url": "https://www.epiloglaser.com/", "title": "Manufacturer documentation"}
+        ]
+        worker.consume(worker.advice_id)
+        assert "Advisory note (JSON data)" not in worker.conversation_context
+        assert worker.research_status["sources"]
+        assert worker.research_status["snippets"]
     finally:
         await worker.close()
     assert client.is_closed()
 
 
 @pytest.mark.asyncio
-async def test_late_advice_is_delivered_with_age_and_not_regenerated_every_turn() -> None:
-    """A slow note still reaches the voice model, flagged as late, without an inference per turn."""
+async def test_late_advice_carries_age_without_research_on_every_turn():
+    """Follow-up conversation continues without causing unsolicited API requests."""
     started = asyncio.Event()
-    release_first = asyncio.Event()
-    published = asyncio.Event()
-    snapshots = []
-    contexts = []
-    client = MagicMock()
-    client.close = AsyncMock()
+    release = asyncio.Event()
+    client = _client()
 
     async def infer(**kwargs):
-        snapshots.append(kwargs["input"])
-        if len(snapshots) == 1:
-            started.set()
-            await release_first.wait()
-            return SimpleNamespace(status="completed", output_parsed=_advice("FIRST ADVICE"))
-        return SimpleNamespace(status="completed", output_parsed=_advice("SECOND ADVICE"))
+        started.set()
+        await release.wait()
+        return SimpleNamespace(status="completed", output_parsed=_advice("LATE ADVICE"), output=[])
 
-    client.responses.parse = AsyncMock(side_effect=infer)
-
-    async def publish() -> None:
-        contexts.append(worker.conversation_context)
-        published.set()
-
-    worker = BackgroundReasoner(client, "grounding", "model", publish, debounce_seconds=0, min_interval_seconds=0)
+    client.responses.parse.side_effect = infer
+    worker = BackgroundReasoner(client, "grounding", "model", AsyncMock(return_value=True), debounce_seconds=0)
     try:
-        worker.observe("user", "First question")
+        worker.observe("user", "Why is my cut uneven?")
+        worker.request("Explain uneven cuts")
         await asyncio.wait_for(started.wait(), 1)
-        worker.observe("assistant", "Tell me more")
-        worker.observe("user", "Actually, a new question")
-        worker.observe("assistant", "A fresh follow-up")
-        await asyncio.sleep(0)
-        assert len(snapshots) == 1
-        release_first.set()
-        await asyncio.wait_for(published.wait(), 1)
-        assert "FIRST ADVICE" in contexts[0]
-        assert '"user_turns_since_request": 1' in contexts[0]
-        assert '"based_on_user_request": "First question"' in contexts[0]
-        # Only one new user turn since the last inference: no regeneration yet.
+        worker.observe("assistant", "Was that everywhere?")
+        worker.observe("user", "Only in the middle")
+        release.set()
+        await _wait_status(worker, "ready")
+        assert '"user_turns_since_request": 1' in worker.conversation_context
+        assert '"based_on_user_request": "Explain uneven cuts"' in worker.conversation_context
+        worker.observe("user", "The material is flat")
         await asyncio.sleep(0.01)
-        assert len(snapshots) == 1
-        published.clear()
-        worker.observe("user", "A follow-up")
-        await asyncio.wait_for(published.wait(), 1)
-        assert len(snapshots) == 2
-        assert "A follow-up" in snapshots[1]
-        assert "SECOND ADVICE" in contexts[-1]
+        assert client.responses.parse.await_count == 1
+        assert '"user_turns_since_request": 2' in worker.conversation_context
+        worker.consume(worker.advice_id)
+        assert worker.advice_id == 0
     finally:
         await worker.close()
 
 
 @pytest.mark.asyncio
-async def test_advice_expires_after_several_user_turns() -> None:
-    """Old advice is dropped once the conversation has clearly moved on."""
-    published = asyncio.Event()
-    client = MagicMock()
-    client.close = AsyncMock()
-    client.responses.parse = AsyncMock(return_value=SimpleNamespace(status="completed", output_parsed=_advice("ADVICE")))
+async def test_new_question_cancels_inflight_research_and_never_delivers_old_result():
+    """A changed question replaces slow research instead of publishing obsolete findings."""
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    client = _client()
 
-    async def publish() -> None:
-        published.set()
+    async def infer(**kwargs):
+        if "FIRST QUESTION" in kwargs["input"]:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+        return SimpleNamespace(status="completed", output_parsed=_advice("NEW ANSWER"), output=[])
 
+    client.responses.parse.side_effect = infer
     worker = BackgroundReasoner(
-        client, "grounding", "model", publish, debounce_seconds=0, min_interval_seconds=0, refresh_user_turns=100
+        client, "grounding", "model", AsyncMock(return_value=True), debounce_seconds=0, min_interval_seconds=0
     )
     try:
+        worker.request("FIRST QUESTION")
+        await asyncio.wait_for(started.wait(), 1)
+        worker.request("SECOND QUESTION")
+        await asyncio.wait_for(cancelled.wait(), 1)
+        await _wait_status(worker, "ready")
+        assert "NEW ANSWER" in worker.conversation_context
+        assert "FIRST QUESTION" not in worker.conversation_context
+        assert worker.advice_id == 2
+        worker.request("SECOND QUESTION")
+        await asyncio.sleep(0.01)
+        assert client.responses.parse.await_count == 2
+    finally:
+        await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_advice_expires_after_four_followup_turns():
+    """Unconsumed notes leave the prompt after the allowed conversation window."""
+    client = _client()
+    worker = BackgroundReasoner(client, "grounding", "model", AsyncMock(return_value=True), debounce_seconds=0)
+    try:
         worker.observe("user", "Question")
-        await asyncio.wait_for(published.wait(), 1)
+        worker.request("Question")
+        await _wait_status(worker, "ready")
         for n in range(4):
             worker.observe("user", f"Turn {n}")
-            assert "ADVICE" in worker.conversation_context
-        published.clear()
+            assert worker.advice_id
         worker.observe("user", "One too many")
-        assert "ADVICE" not in worker.conversation_context
-        await asyncio.wait_for(published.wait(), 1)
+        assert worker.advice_id == 0
+        assert worker.research_status["status"] == "expired"
         assert client.responses.parse.await_count == 1
     finally:
         await worker.close()
 
 
 @pytest.mark.asyncio
-async def test_close_cancels_active_inference_and_pending_updates() -> None:
-    """Disconnecting closes the client without publishing a late answer or leaking tasks."""
+async def test_timeout_reports_unavailable_without_automatic_retry(caplog):
+    """A timeout produces honest availability context while conversation remains usable."""
+    client = _client()
+    cancelled = asyncio.Event()
+
+    async def infer(**kwargs):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    client.responses.parse.side_effect = infer
+    worker = BackgroundReasoner(
+        client, "grounding", "model", AsyncMock(return_value=True), debounce_seconds=0, timeout_seconds=0.01
+    )
+    try:
+        worker.request("Question")
+        await _wait_status(worker, "unavailable")
+        worker.observe("user", "We can still talk")
+        await asyncio.sleep(0.01)
+        assert cancelled.is_set()
+        assert "Background reasoning unavailable: TimeoutError" in caplog.text
+        assert "Research status: unavailable" in worker.conversation_context
+        assert client.responses.parse.await_count == 1
+    finally:
+        await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_close_cancels_research_and_publication():
+    """Closing a session cancels network work and rejects later requests."""
     started = asyncio.Event()
     cancelled = asyncio.Event()
-    client = MagicMock()
-    client.close = AsyncMock()
+    client = _client()
 
     async def infer(**kwargs):
         started.set()
@@ -186,73 +262,51 @@ async def test_close_cancels_active_inference_and_pending_updates() -> None:
         finally:
             cancelled.set()
 
-    client.responses.parse = AsyncMock(side_effect=infer)
-    publish = AsyncMock()
-    worker = BackgroundReasoner(client, "grounding", "model", publish, debounce_seconds=0)
-    worker.observe("user", "Question")
+    client.responses.parse.side_effect = infer
+    worker = BackgroundReasoner(client, "grounding", "model", AsyncMock(return_value=True), debounce_seconds=0)
+    worker.request("Question")
     await asyncio.wait_for(started.wait(), 1)
-    worker.observe("assistant", "Follow-up")
     await worker.close()
     await worker.close()
-    worker.observe("user", "Too late")
     assert cancelled.is_set()
-    assert client.responses.parse.await_count == 1
-    publish.assert_not_awaited()
+    assert "error" in worker.request("Too late")
     client.close.assert_awaited_once()
 
 
+@pytest.mark.parametrize(
+    "status,advice", [("incomplete", _advice()), ("completed", None), ("completed", _advice("x" * 601))]
+)
 @pytest.mark.asyncio
-async def test_timeout_preserves_conversation_and_throttles_pending_retry(caplog) -> None:
-    """A slow API call times out without starting a retry loop or publishing partial advice."""
-    started = asyncio.Event()
-    cancelled = asyncio.Event()
-    client = MagicMock()
-    client.close = AsyncMock()
-
-    async def infer(**kwargs):
-        started.set()
-        try:
-            await asyncio.Event().wait()
-        finally:
-            cancelled.set()
-
-    client.responses.parse = AsyncMock(side_effect=infer)
-    publish = AsyncMock()
-    worker = BackgroundReasoner(client, "grounding", "model", publish, debounce_seconds=0, timeout_seconds=0.01)
+async def test_incomplete_refused_and_oversized_results_are_unavailable(status, advice):
+    """Invalid model results cannot become spoken research findings."""
+    client = _client()
+    client.responses.parse.return_value = SimpleNamespace(status=status, output_parsed=advice, output=[])
+    worker = BackgroundReasoner(client, "grounding", "model", AsyncMock(return_value=True), debounce_seconds=0)
     try:
-        worker.observe("user", "Question")
-        await asyncio.wait_for(started.wait(), 1)
-        worker.observe("assistant", "Conversation continues")
-        await asyncio.wait_for(cancelled.wait(), 1)
-        await asyncio.sleep(0.01)
-        assert "Background reasoning unavailable: TimeoutError" in caplog.text
-        assert client.responses.parse.await_count == 1
-        publish.assert_not_awaited()
-    finally:
-        await worker.close()
-
-
-@pytest.mark.parametrize("status,advice", [("incomplete", _advice()), ("completed", None)])
-@pytest.mark.asyncio
-async def test_incomplete_or_refused_response_is_not_published(status, advice, caplog) -> None:
-    """Refusals and token-truncated results cannot reach the voice model as guidance."""
-    client = MagicMock()
-    client.close = AsyncMock()
-    client.responses.parse = AsyncMock(return_value=SimpleNamespace(status=status, output_parsed=advice))
-    publish = AsyncMock()
-    worker = BackgroundReasoner(client, "grounding", "model", publish, debounce_seconds=0)
-    try:
-        worker.observe("user", "Question")
-        await asyncio.sleep(0.01)
-        publish.assert_not_awaited()
-        assert "no complete advisory note" in caplog.text
+        worker.request("Question")
+        await _wait_status(worker, "unavailable")
+        assert worker.advice_id == 0
     finally:
         await worker.close()
 
 
 @pytest.mark.asyncio
-async def test_factory_uses_both_documents_and_dedicated_openai_client(tmp_path: Path, monkeypatch) -> None:
-    """Tutor and shop files go to OpenAI through a separate, explicitly addressed client."""
+async def test_publication_does_not_report_a_disconnected_update_as_sent(caplog):
+    """A disconnected session is never logged as receiving the note."""
+    worker = BackgroundReasoner(_client(), "grounding", "model", AsyncMock(return_value=False), debounce_seconds=0)
+    try:
+        worker.request("Question")
+        await _wait_status(worker, "ready")
+        await asyncio.sleep(0.01)
+        assert "Research context not sent" in caplog.text
+        assert "context sent:" not in caplog.text
+    finally:
+        await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_factory_uses_both_documents_and_dedicated_client(tmp_path: Path, monkeypatch):
+    """The advisor receives both grounding files through its own OpenAI client."""
     tutor = tmp_path / "tutor.md"
     tutor.write_text("Ask one question at a time.")
     shop = tmp_path / "shop.md"
@@ -264,27 +318,19 @@ async def test_factory_uses_both_documents_and_dedicated_openai_client(tmp_path:
     monkeypatch.setattr(config, "REASONING_EFFORT", "high")
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.setenv("OPENAI_BASE_URL", "https://wrong.example/v1")
-    client = MagicMock()
-    client.responses.parse = AsyncMock(return_value=SimpleNamespace(status="completed", output_parsed=_advice()))
-    client.close = AsyncMock()
+    client = _client()
     constructor = MagicMock(return_value=client)
     monkeypatch.setattr(reasoning_mod, "AsyncOpenAI", constructor)
-    published = asyncio.Event()
-
-    async def publish() -> None:
-        published.set()
-
-    worker = create_background_reasoner(publish)
+    worker = create_background_reasoner(AsyncMock(return_value=True))
     assert worker is not None
     try:
-        worker.observe("user", "How do I start?")
-        await asyncio.wait_for(published.wait(), 2)
+        worker.request("How do I start?")
+        await _wait_status(worker, "ready")
         request = client.responses.parse.call_args.kwargs
         assert request["model"] == "custom-reasoner"
         assert request["extra_body"]["reasoning"] == {"effort": "high"}
-        instructions = request["instructions"]
-        assert tutor.read_text() in instructions
-        assert shop.read_text() in instructions
+        assert tutor.read_text() in request["instructions"]
+        assert shop.read_text() in request["instructions"]
         assert constructor.call_args.kwargs["base_url"] == "https://api.openai.com/v1"
         assert constructor.call_args.kwargs["api_key"] == "test-key"
         assert constructor.call_args.kwargs["max_retries"] == 0
@@ -292,8 +338,8 @@ async def test_factory_uses_both_documents_and_dedicated_openai_client(tmp_path:
         await worker.close()
 
 
-def test_missing_key_or_grounding_disables_only_reasoner(tmp_path: Path, monkeypatch, caplog) -> None:
-    """Incomplete setup warns without creating a network client or stopping conversation."""
+def test_missing_key_or_grounding_disables_only_reasoner(tmp_path: Path, monkeypatch, caplog):
+    """Incomplete setup disables research without raising into the voice loop."""
     monkeypatch.setattr(config, "REASONING_ENABLED", True)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     assert create_background_reasoner(AsyncMock()) is None
@@ -304,16 +350,108 @@ def test_missing_key_or_grounding_disables_only_reasoner(tmp_path: Path, monkeyp
     assert "Cannot read REACHY_MINI_REASONING_GROUNDING_FILE" in caplog.text
 
 
-def test_reasoning_config_reloads_from_environment(monkeypatch) -> None:
-    """Instance .env loading updates the reasoner configuration along with other settings."""
-    for name in ("REASONING_ENABLED", "REASONING_MODEL", "REASONING_EFFORT", "REASONING_GROUNDING_FILE"):
+def test_reasoning_config_reloads_from_environment(monkeypatch):
+    """Instance configuration updates both the model and web-search availability."""
+    for name in (
+        "REASONING_ENABLED",
+        "REASONING_MODEL",
+        "REASONING_EFFORT",
+        "REASONING_GROUNDING_FILE",
+        "REASONING_WEB_SEARCH",
+    ):
         monkeypatch.setattr(config, name, getattr(config, name))
     monkeypatch.setenv("REACHY_MINI_REASONING_ENABLED", "true")
     monkeypatch.setenv("REACHY_MINI_REASONING_MODEL", "custom-reasoner")
     monkeypatch.setenv("REACHY_MINI_REASONING_EFFORT", " High ")
     monkeypatch.setenv("REACHY_MINI_REASONING_GROUNDING_FILE", "tutor.md")
+    monkeypatch.setenv("REACHY_MINI_REASONING_WEB_SEARCH", "false")
     refresh_runtime_config_from_env()
     assert config.REASONING_ENABLED is True
     assert config.REASONING_MODEL == "custom-reasoner"
     assert config.REASONING_EFFORT == "high"
     assert config.REASONING_GROUNDING_FILE == "tutor.md"
+    assert config.REASONING_WEB_SEARCH is False
+
+
+@pytest.mark.asyncio
+async def test_general_question_search_and_answer_are_visible_in_status_and_recording(tmp_path):
+    """A history question retains its topic and records actual search execution independently of citations."""
+    archive = ExperimentLog(tmp_path)
+    client = _client(ReasoningAdvice(snippets=["A historical explanation."], next_question="", uncertainty=""))
+    client.responses.parse.return_value.output = [SimpleNamespace(type="web_search_call")]
+    worker = BackgroundReasoner(
+        client,
+        "general researcher",
+        "test-model",
+        AsyncMock(return_value=True),
+        debounce_seconds=0,
+        experiment_log=archive,
+    )
+    try:
+        question = "Look up the causes of the Yom Kippur War."
+        worker.observe("user", question)
+        worker.request(question, True)
+        await _wait_status(worker, "ready")
+        request = client.responses.parse.call_args.kwargs
+        assert question in request["input"]
+        assert request["tool_choice"] == "required"
+        assert worker.research_status["web_search_calls"] == 1
+        assert worker.research_status["question"] == question
+        assert worker.research_status["model"] == "test-model"
+        await archive.access("status")
+        rows = [json.loads(line) for line in gzip.decompress(archive.path.read_bytes()).splitlines()]
+        assert next(row for row in rows if row["e"] == "research_requested")["search_web"] is True
+        assert next(row for row in rows if row["e"] == "research_response")["web_search_calls"] == 1
+    finally:
+        await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_explicit_lookup_does_not_pretend_to_search_when_search_disabled():
+    """A requested lookup is rejected truthfully when the operator disables web search."""
+    client = _client()
+    worker = BackgroundReasoner(client, "grounding", "model", AsyncMock(return_value=True), web_search=False)
+    try:
+        assert "disabled" in worker.request("Look up a historical event", True)["error"]
+        await asyncio.sleep(0.01)
+        client.responses.parse.assert_not_awaited()
+    finally:
+        await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_request_failure_has_actionable_status_without_exposing_provider_payload(tmp_path):
+    """Configuration failures are visible without copying provider error bodies into the archive."""
+    client = _client()
+    client.responses.parse.side_effect = BadRequestError(
+        "private-provider-payload",
+        response=httpx.Response(400, request=httpx.Request("POST", "https://example.org")),
+        body=None,
+    )
+    archive = ExperimentLog(tmp_path)
+    worker = BackgroundReasoner(
+        client, "grounding", "model", AsyncMock(return_value=True), debounce_seconds=0, experiment_log=archive
+    )
+    try:
+        worker.request("Explain an event")
+        await _wait_status(worker, "unavailable")
+        assert "Check the model" in worker.research_status["error"]
+        await archive.access("status")
+        saved = gzip.decompress(archive.path.read_bytes()).decode()
+        assert "Check the model" in saved
+        assert "private-provider-payload" not in saved
+    finally:
+        await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_disabled_setup_is_recorded_for_later_diagnosis(tmp_path, monkeypatch):
+    """A dump can distinguish missing setup from a voice model that never asks for research."""
+    monkeypatch.setattr(config, "REASONING_ENABLED", True)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    archive = ExperimentLog(tmp_path)
+    assert create_background_reasoner(AsyncMock(), experiment_log=archive) is None
+    await archive.access("status")
+    row = json.loads(gzip.decompress(archive.path.read_bytes()))
+    assert row["e"] == "research_setup" and row["enabled"] is False
+    assert "OPENAI_API_KEY" in row["reason"]

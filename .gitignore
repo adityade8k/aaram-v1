@@ -50,6 +50,7 @@ coverage.xml
 # Temporary files
 tmp/
 *.log
+experiment.jsonl.gz
 cache/
 
 # macOS

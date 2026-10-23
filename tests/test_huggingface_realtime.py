@@ -1,3 +1,4 @@
+import gzip
 import json
 import time
 import base64
@@ -17,6 +18,7 @@ from reachy_mini_conversation_app.streaming import AdditionalOutputs
 from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
 from reachy_mini_conversation_app.background_reasoning import ReasoningAdvice, BackgroundReasoner
 from reachy_mini_conversation_app.huggingface_realtime import HuggingFaceRealtimeHandler
+from reachy_mini_conversation_app.tools.research_question import ResearchQuestion
 from reachy_mini_conversation_app.tools.background_tool_manager import ToolState, ToolNotification
 
 
@@ -28,6 +30,8 @@ class _FakeEvent:
 
     def __init__(self, event_type: str, **fields: Any) -> None:
         """Store the event type and any extra attributes."""
+        self.response = SimpleNamespace(status="completed")
+        self.item_id = "item-1"
         self.type = event_type
         self.__dict__.update(fields)
 
@@ -214,13 +218,13 @@ async def test_audio_continues_during_reasoning_and_advice_updates_live_instruct
     async def infer(**kwargs):
         inference_started.set()
         await release_inference.wait()
-        return SimpleNamespace(status="completed", output_parsed=advice)
+        return SimpleNamespace(status="completed", output_parsed=advice, output=[])
 
     advisor_client.responses.parse = AsyncMock(side_effect=infer)
 
-    def reasoner_factory(publish):
+    def reasoner_factory(publish, **kwargs):
         return BackgroundReasoner(
-            advisor_client, "tutor", "model", publish, debounce_seconds=0, min_interval_seconds=5
+            advisor_client, "tutor", "model", publish, debounce_seconds=0, min_interval_seconds=5, **kwargs
         )
 
     monkeypatch.setattr(hf_mod, "create_background_reasoner", reasoner_factory)
@@ -239,6 +243,8 @@ async def test_audio_continues_during_reasoning_and_advice_updates_live_instruct
 
     async def events():
         yield _FakeEvent("conversation.item.input_audio_transcription.completed", transcript="My cut failed.")
+        assert handler.deps.request_research is not None
+        assert handler.deps.request_research("My cut failed.")["status"] == "researching"
         await asyncio.wait_for(inference_started.wait(), 1)
         yield _FakeEvent("response.created")
         yield _FakeEvent("response.output_audio.delta", delta=base64.b64encode(pcm.tobytes()).decode())
@@ -1016,3 +1022,244 @@ async def test_run_session_response_lifecycle_toggles_done_event(monkeypatch: An
     assert handler._response_done_event.is_set()
     handler.deps.movement_manager.set_speaking.assert_any_call(True)
     handler.deps.movement_manager.set_speaking.assert_any_call(False)
+
+
+@pytest.mark.asyncio
+async def test_research_replaces_blocking_search_tools_only_when_available(monkeypatch):
+    """Voice research is an immediate handoff rather than a direct slow web lookup."""
+    handler = _plain_handler()
+    specs = [
+        {"type": "function", "name": name, "description": "test", "parameters": {}}
+        for name in ["research_question", "move_head", *hf_mod._RESEARCH_TOOL_NAMES]
+    ]
+    assert "research_question" not in {s["name"] for s in handler._conversation_tool_specs(specs)}
+    worker = BackgroundReasoner(MagicMock(), "shop", "model", AsyncMock(return_value=True))
+    worker._client.close = AsyncMock()
+    handler._reasoner = worker
+    try:
+        names = {s["name"] for s in handler._conversation_tool_specs(specs)}
+        assert names == {"research_question", "move_head"}
+    finally:
+        await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_research_continuation_waits_for_playback_and_user_speech(monkeypatch):
+    """A ready finding cannot begin speaking over queued audio or the student."""
+    monkeypatch.setattr(hf_mod, "_RESEARCH_QUIET_SECONDS", 0)
+    client = MagicMock()
+    client.close = AsyncMock()
+    client.responses.parse = AsyncMock(
+        return_value=SimpleNamespace(
+            status="completed",
+            output_parsed=ReasoningAdvice(snippets=["Finding"], next_question="", uncertainty=""),
+            output=[],
+        )
+    )
+    handler = _plain_handler()
+    handler.connection = MagicMock()
+    handler.last_activity_time = 0
+    worker = BackgroundReasoner(client, "shop", "model", AsyncMock(return_value=True), debounce_seconds=0)
+    handler._reasoner = worker
+    task = None
+    try:
+        worker.observe("user", "Question")
+        worker.request("Question")
+        async with asyncio.timeout(1):
+            while not worker.advice_id:
+                await asyncio.sleep(0.001)
+        handler.playback_until = time.monotonic() + 10
+        task = asyncio.create_task(handler._resume_after_research(worker.advice_id, worker.user_turn, 0))
+        await asyncio.sleep(0.12)
+        assert handler._pending_responses.empty()
+        handler.playback_until = 0
+        handler._user_speaking = True
+        await asyncio.sleep(0.12)
+        assert handler._pending_responses.empty()
+        handler._user_speaking = False
+        await asyncio.wait_for(task, 1)
+        request = handler._pending_responses.get_nowait()
+        assert request["_research_id"] == worker.advice_id
+        assert handler._pending_responses.empty()
+    finally:
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_queued_research_speech_is_dropped_if_student_starts_a_new_turn(monkeypatch):
+    """The final sender rechecks input after a continuation has already been queued."""
+    handler = _plain_handler()
+    handler._reasoner = SimpleNamespace(advice_id=1, user_turn=1)
+    handler.connection = MagicMock()
+    handler.connection.response.create = AsyncMock()
+    handler._response_done_event.clear()
+    await handler._safe_response_create(_research_id=1, _research_turn=1, _research_speech=0)
+    task = asyncio.create_task(handler._response_sender_loop())
+    try:
+        await asyncio.sleep(0.01)
+        handler._user_speech_serial = 1
+        handler._user_speaking = True
+        handler._response_done_event.set()
+        await asyncio.sleep(0.01)
+        handler.connection.response.create.assert_not_awaited()
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_late_research_is_context_only_without_forcing_an_old_topic(monkeypatch):
+    """A result overtaken by another user turn waits for a relevant natural reply."""
+    handler = _plain_handler()
+    handler.connection = MagicMock()
+    handler.connection.session.update = AsyncMock()
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "shop")
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    client = MagicMock()
+    client.close = AsyncMock()
+    client.responses.parse = AsyncMock(
+        return_value=SimpleNamespace(
+            status="completed",
+            output_parsed=ReasoningAdvice(snippets=["Finding"], next_question="", uncertainty=""),
+            output=[],
+        )
+    )
+    worker = BackgroundReasoner(client, "shop", "model", AsyncMock(return_value=True), debounce_seconds=0)
+    handler._reasoner = worker
+    try:
+        worker.observe("user", "First question")
+        worker.request("First question")
+        worker.observe("user", "Actually, a different topic")
+        async with asyncio.timeout(1):
+            while not worker.advice_id:
+                await asyncio.sleep(0.001)
+        assert await handler._publish_research()
+        assert handler._research_followup_task is None
+        assert handler._pending_responses.empty()
+        assert "Finding" in handler.connection.session.update.call_args.kwargs["session"]["instructions"]
+    finally:
+        await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_recording_keeps_user_and_interrupted_partial_response(monkeypatch):
+    """Generated partial speech remains analysable even without a final transcript event."""
+    handler = _session_handler(
+        monkeypatch,
+        (
+            _FakeEvent("conversation.item.input_audio_transcription.completed", transcript="Why did it fail?"),
+            _FakeEvent("response.created"),
+            _FakeEvent("response.output_audio_transcript.delta", delta="Which "),
+            _FakeEvent("response.output_audio_transcript.delta", delta="material?"),
+            _FakeEvent("input_audio_buffer.speech_started"),
+            _FakeEvent("response.done", response=SimpleNamespace(status="cancelled")),
+            _FakeEvent("conversation.item.input_audio_transcription.completed", transcript="Acrylic."),
+            _FakeEvent("response.created"),
+            _FakeEvent("response.output_audio_transcript.done", transcript="I will check that."),
+            _FakeEvent("response.done"),
+        ),
+    )
+    await handler._run_realtime_session()
+    records = [json.loads(line) for line in gzip.decompress(handler.experiment_log.path.read_bytes()).splitlines()]
+    assert [row["text"] for row in records if row["e"] == "input"] == ["Why did it fail?", "Acrylic."]
+    replies = [row for row in records if row["e"] == "response"]
+    assert [row["text"] for row in replies] == ["Which material?", "I will check that."]
+    assert replies[0]["interrupted"] and replies[0]["status"] == "cancelled"
+    assert not replies[1]["interrupted"] and replies[1]["status"] == "completed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "question,clarification,search_web",
+    [
+        ("Why did my cut fail?", "Which material did you use?", False),
+        ("Look up the causes of the Yom Kippur War.", "Are you focusing on causes or main events?", True),
+    ],
+)
+async def test_real_tool_handoff_returns_and_speaks_before_research_finishes(
+    monkeypatch, question, clarification, search_web
+):
+    """The full tool dispatcher and result callback unblock speech while inference is pending."""
+    handler = _plain_handler()
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "Shop")
+    monkeypatch.setattr(hf_mod, "get_session_greeting_prompt", lambda: "")
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [ResearchQuestion().spec()])
+    monkeypatch.setattr(hf_mod.core_tools, "get_tools", lambda: {"research_question": ResearchQuestion()})
+    started, release, resumed, ready = (asyncio.Event() for _ in range(4))
+    advisor_client = MagicMock()
+    advisor_client.close = AsyncMock()
+
+    async def infer(**kwargs):
+        assert question in kwargs["input"]
+        assert kwargs["tool_choice"] == ("required" if search_web else "auto")
+        started.set()
+        await release.wait()
+        return SimpleNamespace(
+            status="completed",
+            output_parsed=ReasoningAdvice(snippets=["Research finding"], next_question="", uncertainty=""),
+            output=[],
+        )
+
+    advisor_client.responses.parse = AsyncMock(side_effect=infer)
+    monkeypatch.setattr(
+        hf_mod,
+        "create_background_reasoner",
+        lambda publish, **kwargs: BackgroundReasoner(
+            advisor_client, "Shop", "model", publish, debounce_seconds=0, **kwargs
+        ),
+    )
+    conn = MagicMock()
+    conn.__aenter__ = AsyncMock(return_value=conn)
+    conn.__aexit__ = AsyncMock(return_value=False)
+    conn.conversation.item.create = AsyncMock()
+
+    async def respond(**kwargs):
+        resumed.set()
+
+    async def update(*, session):
+        if "Research finding" in session.get("instructions", ""):
+            ready.set()
+
+    conn.response.create = AsyncMock(side_effect=respond)
+    conn.session.update = AsyncMock(side_effect=update)
+
+    async def events():
+        yield _FakeEvent("conversation.item.input_audio_transcription.completed", transcript=question)
+        yield _FakeEvent("response.created")
+        yield _FakeEvent(
+            "response.function_call_arguments.done",
+            name="research_question",
+            call_id="research-1",
+            arguments=json.dumps({"question": question, "search_web": search_web}),
+        )
+        yield _FakeEvent("response.done")
+        await asyncio.wait_for(resumed.wait(), 1)
+        await asyncio.wait_for(started.wait(), 1)
+        assert not ready.is_set()
+        result = conn.conversation.item.create.call_args.kwargs["item"]
+        assert json.loads(result["output"])["status"] == "researching"
+        yield _FakeEvent("response.created")
+        yield _FakeEvent("response.output_audio.delta", delta=base64.b64encode(b"\x00\x00").decode())
+        yield _FakeEvent("response.output_audio_transcript.done", transcript=clarification)
+        yield _FakeEvent("response.done")
+        release.set()
+        await asyncio.wait_for(ready.wait(), 1)
+        assert handler._reasoner.advice_id == 1
+        yield _FakeEvent("response.created")
+        yield _FakeEvent("response.output_audio.delta", delta=base64.b64encode(b"\x00\x00").decode())
+        yield _FakeEvent("response.output_audio_transcript.done", transcript="Here is the relevant finding.")
+        yield _FakeEvent("response.done")
+        assert handler._reasoner.advice_id == 0
+
+    conn.__aiter__.side_effect = events
+    handler.client = MagicMock()
+    handler.client.realtime.connect.return_value = conn
+    await handler._run_realtime_session()
+    rows = [json.loads(line) for line in gzip.decompress(handler.experiment_log.path.read_bytes()).splitlines()]
+    events_saved = [row["e"] for row in rows]
+    assert events_saved.index("tool_result") < events_saved.index("research_response")
+    assert events_saved.index("response", events_saved.index("tool_result")) < events_saved.index("research_response")
+    assert "research_exposed" in events_saved

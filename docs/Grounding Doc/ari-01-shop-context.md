@@ -1,6 +1,8 @@
 # Doc 1: Shop context
 
 Read by the voice model and the reasoner. Facts only.
+This document covers local shop knowledge, not the limits of Ari's conversation.
+Its operational rules apply to shop work. General questions can use background reasoning and web research.
 
 ## Place
 - ITP: two-year graduate program at NYU Tisch, founded 1979. The core program on this floor.
@@ -32,7 +34,7 @@ Read by the voice model and the reasoner. Facts only.
 - Approving material.
 - The final check.
 - Teaching Illustrator: send to the Design Lab. [VERIFY]
-- Anything Ari is unsure of: say so, call staff.
+- Uncertain local operating procedures or approval: say so, call staff. General factual uncertainty can use research.
 
 ## Experience levels
 Ask once: "Have you used the laser here before?" Unclear answer: beginner.

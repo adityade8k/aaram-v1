@@ -4,7 +4,7 @@
  * Robot stays live, tapping the orb only mutes or unmutes the user's mic.
  */
 
-import { applyPersonality, getMicState, listPersonalities, setMicMuted, subscribe } from "../api.js";
+import { applyPersonality, experimentLog, getMicState, getResearchStatus, listPersonalities, setMicMuted, subscribe } from "../api.js";
 import { ORB_STATES } from "../constants.js";
 import { createOrb, mapActivityToState } from "../orb.js";
 import { consumePendingApply } from "../pending-apply.js";
@@ -32,6 +32,13 @@ export async function mountTalkView({ outlet, signal }) {
   let togglePending = false;
   let activePersonality = null;
   let subscription = null;
+  let researchSubscription = null;
+  let researchRefresh = 0;
+  const references = h("aside", { class: "talk__references", hidden: true, "aria-label": "Research references" });
+  const logStatus = h("p", { class: "talk__log-status", role: "status", "aria-live": "polite" }, "Checking recording…");
+  const downloadLog = h("button", { class: "btn btn--ghost", type: "button", onclick: onDownloadLog }, "Download data");
+  const clearLog = h("button", { class: "btn btn--ghost", type: "button", onclick: onClearLog }, "Clear data…");
+  let logBusy = false;
 
   const caption = h(
     "p",
@@ -59,9 +66,20 @@ export async function mountTalkView({ outlet, signal }) {
     "section",
     { class: "view view--talk" },
     h("div", { class: "talk__orb-wrap" }, orb.root),
-    caption
+    caption,
+    references,
+    h("div", { class: "talk__log", "aria-label": "Experiment recording" },
+      logStatus,
+      h("div", { class: "talk__log-actions" }, downloadLog, clearLog)
+    )
   );
   outlet.replaceChildren(view);
+  researchSubscription = subscribe("conversation.activity", ({ reason } = {}) => {
+    if (reason === "research_updated") void refreshResearch();
+  });
+  void refreshResearch();
+  void refreshLog();
+  const logTimer = setInterval(refreshLog, 10000);
 
   if (pending) {
     caption.textContent = `Applying "${prettifyProfileName(pending.name)}"…`;
@@ -113,11 +131,113 @@ export async function mountTalkView({ outlet, signal }) {
   });
 
   function cleanup() {
+    clearInterval(logTimer);
     subscription?.close();
+    researchSubscription?.();
     orb.dispose();
     if (defaultAction) {
       defaultAction.hidden = true;
       defaultAction.removeEventListener("click", onSetDefault);
+    }
+  }
+
+  async function refreshLog() {
+    if (logBusy) return;
+    try {
+      const log = await experimentLog();
+      if (signal.aborted || logBusy) return;
+      logStatus.textContent = log.error || `Text recording on · ${(log.bytes / 1024).toFixed(1)} KB saved`;
+      logStatus.title = log.path;
+      downloadLog.disabled = !log.bytes;
+      clearLog.disabled = !log.bytes && !log.error;
+    } catch (error) {
+      if (!signal.aborted && !logBusy) logStatus.textContent = `Recording status unavailable: ${error.message}`;
+    }
+  }
+
+  async function onDownloadLog() {
+    if (logBusy) return;
+    logBusy = true;
+    downloadLog.disabled = clearLog.disabled = true;
+    try {
+      const log = await experimentLog();
+      if (!log.bytes) throw new Error("No recorded conversation yet.");
+      const chunks = [];
+      let offset = 0;
+      while (offset < log.bytes) {
+        if (signal.aborted) return;
+        const chunk = await experimentLog({ action: "read", offset, limit: log.bytes, generation: log.generation });
+        if (chunk.next_offset <= offset) throw new Error("Download stopped. Please try again.");
+        chunks.push(Uint8Array.from(atob(chunk.content), (char) => char.charCodeAt(0)));
+        offset = chunk.next_offset;
+        logStatus.textContent = `Downloading data… ${Math.round(offset / log.bytes * 100)}%`;
+      }
+      if (signal.aborted) return;
+      const url = URL.createObjectURL(new Blob(chunks, { type: "application/gzip" }));
+      const link = h("a", { href: url, download: log.filename, hidden: true });
+      document.body.append(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      logStatus.textContent = "Downloaded. Recording continues in the same file.";
+    } catch (error) {
+      if (!signal.aborted) logStatus.textContent = `Could not download: ${error.message}`;
+    } finally {
+      logBusy = false;
+      downloadLog.disabled = clearLog.disabled = false;
+    }
+  }
+
+  async function onClearLog() {
+    if (logBusy || !window.confirm("Permanently clear all saved experiment data? Download it first if you need a copy. New conversation will continue recording.")) return;
+    logBusy = true;
+    downloadLog.disabled = clearLog.disabled = true;
+    try {
+      await experimentLog({ action: "clear", confirm: true });
+      if (!signal.aborted) logStatus.textContent = "Saved data cleared. New conversation will continue recording.";
+    } catch (error) {
+      if (!signal.aborted) logStatus.textContent = `Could not clear data: ${error.message}`;
+    } finally {
+      logBusy = false;
+      downloadLog.disabled = clearLog.disabled = false;
+    }
+  }
+
+  async function refreshResearch() {
+    const refresh = ++researchRefresh;
+    try {
+      const research = await getResearchStatus();
+      if (signal.aborted || refresh !== researchRefresh) return;
+      references.replaceChildren();
+      const sources = (research.sources || []).filter((source) => {
+        try {
+          const url = new URL(source.url);
+          return ["http:", "https:"].includes(url.protocol) && !url.username;
+        } catch {
+          return false;
+        }
+      });
+      references.hidden = false;
+      const snippets = research.snippets || [];
+      if (research.status === "researching") {
+        references.append(h("strong", {}, "Research running"));
+        references.append(h("p", {}, research.question || "Checking your question while we talk…"));
+      } else if (["unavailable", "disabled"].includes(research.status)) {
+        references.append(h("p", {}, research.error || "Background research is unavailable right now."));
+      } else if (snippets.length || sources.length) {
+        references.append(h("strong", {}, research.web_search_calls > 0 ? "Research complete · web searched" : "Research complete · no web search used"));
+        for (const snippet of snippets) {
+          references.append(h("p", {}, snippet.replace(/\[([^\]]+)\]\(https?:\/\/[^\s)]+\)/g, "$1")));
+        }
+        references.append(h("ul", {}, sources.map((source) => h("li", {},
+          h("a", { href: source.url, target: "_blank", rel: "noopener noreferrer" }, source.title || source.url)
+        ))));
+      } else {
+        references.append(h("p", {}, research.web_search_enabled ? "Research ready · web search available" : "Research ready · web search off"));
+      }
+      if (research.model) references.append(h("small", {}, `Research model: ${research.model}`));
+    } catch (error) {
+      if (!signal.aborted) console.warn("Could not load research references", error);
     }
   }
 

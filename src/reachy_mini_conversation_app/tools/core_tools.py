@@ -44,6 +44,7 @@ class ToolDependencies:
     camera_enabled: bool = False
     motion_duration_s: float = 1.0
     go_to_sleep: Callable[[], dict[str, Any]] | None = None
+    request_research: Callable[[str, bool], dict[str, str]] | None = None
 
 
 class ToolSpec(TypedDict):
@@ -304,6 +305,8 @@ def _read_profile_tool_names(instance_path: str | Path | None) -> list[str]:
         raise RuntimeError(f"Failed to read tools for profile {profile!r}") from exc
 
     tool_names.extend(tool.value for tool in SystemTool if tool.value not in tool_names)
+    if "research_question" not in tool_names:
+        tool_names.append("research_question")
 
     if config.AUTOLOAD_EXTERNAL_TOOLS:
         discovered_external_tools = list_tool_module_names(config.TOOLS_DIRECTORY)

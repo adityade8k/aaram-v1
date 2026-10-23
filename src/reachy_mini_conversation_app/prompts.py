@@ -68,7 +68,9 @@ def get_session_instructions(instance_path: str | Path | None = None) -> str:
             "Use the following document for your identity, location, local facts, and shop rules. "
             "It takes precedence over conflicting personality text or remembered facts. "
             "Do not invent missing shop information or infer staff approval from this document; "
-            "refer uncertain shop questions to staff.\n\n"
+            "refer uncertain shop operating procedures and approvals to staff. "
+            "This document defines local expertise, not a restriction on conversation topics. "
+            "Answer general questions and use available research tools for information beyond it.\n\n"
             f"{grounding}"
         )
 

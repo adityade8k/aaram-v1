@@ -25,6 +25,7 @@ Conversational app for the Reachy Mini robot combining realtime voice, vision, p
 - [Installation](#installation)
 - [Configuration](#configuration)
 - [Running the app](#running-the-app)
+- [Download data from Terminal](#download-data-from-terminal)
 - [LLM tools](#llm-tools-exposed-to-the-assistant)
 - [Creating and adding tools](#creating-and-adding-tools)
 - [Advanced features](#advanced-features)
@@ -140,85 +141,190 @@ file that is missing, unreadable or empty prevents an ungrounded session from
 starting and produces an error naming the file. Unset the variable to disable it.
 For a wheel-only installation, provide an absolute path to your own document.
 
-### Ari's background reasoning
+### Ari's background research
 
-Ari's existing Hugging Face conversation model handles hearing and speaking. An
-optional OpenAI advisor receives finished user and assistant transcripts while
-that conversation continues. It uses both the shop context above and
-`docs/Grounding Doc/ari-02-tutor-principles.md`. The tutor document is the place to
-edit the reasoning model's teaching approach and add broader reference context.
+This experiment gives Ari local expertise in laser cutting while keeping
+conversation open to any topic, including history, science, art, and project
+context. It uses the Hugging Face voice model for short conversation and a
+separate OpenAI advisor for questions beyond the local documents, uncertain
+answers, complicated explanations, and web research. The voice model chooses the
+`research_question` tool when it needs help; there is no calibrated confidence
+score. Ordinary conversation alone does not start paid research requests.
 
 ```text
 Reachy mic → Hugging Face conversation model → Reachy speaker
-                  │ finished transcripts           ↑
-                  └→ OpenAI reasoning → short advisory notes
+                     │ research_question         ↑
+                     │ immediate acknowledgement │ brief at a conversational pause
+                     └→ OpenAI advisor + web search
 ```
 
-The general architecture image above does not yet include this optional advisor.
+The advisor receives recent transcripts, the requested question, the shop context,
+and `docs/Grounding Doc/ari-02-reasoner-playbook.md`. Local rules and staff approval
+requirements remain in the immediate voice prompt. Web findings do not override
+those rules, approve materials, or supply permission to operate a machine.
+The general architecture image above does not yet show this research handoff.
 
-To enable it:
+Configure the local `.env`:
 
-1. Set up [OpenAI API billing](https://platform.openai.com/settings/organization/billing/overview)
-   and create an [API key](https://platform.openai.com/api-keys).
-   [ChatGPT Pro and API usage have separate billing](https://help.openai.com/en/articles/9039756-managing-billing-for-chatgpt-and-the-api-platform).
-2. Edit the local `.env` (ignored by Git):
-   ```env
-   OPENAI_API_KEY=your-api-key
-   REACHY_MINI_REASONING_ENABLED=true
-   REACHY_MINI_REASONING_MODEL=gpt-6-astra
-   REACHY_MINI_REASONING_EFFORT=medium
-   REACHY_MINI_REASONING_GROUNDING_FILE="docs/Grounding Doc/ari-02-tutor-principles.md"
-   ```
-3. Restart the app from this folder:
-   ```bash
-   source .venv/bin/activate
-   reachy-mini-conversation-app --no-camera
-   ```
-4. Ask a shop question, then keep talking. Logs show `Background reasoning
-   started`, `Background reasoning ready`, and `Background reasoning context sent
-   to conversation model`. These report the handoff, not a guarantee the voice
-   model will use every note. Try: “My test cut did not go all the way through.”
-   Supply the material and what you observed when Ari asks. The advisor should
-   suggest a useful diagnostic question, acknowledge missing facts, and defer
-   machine settings and approval to staff.
+```env
+REACHY_MINI_CUSTOM_PROFILE=ari
+REACHY_MINI_GROUNDING_FILE="docs/Grounding Doc/ari-01-shop-context.md"
+REACHY_MINI_REASONING_ENABLED=true
+OPENAI_API_KEY=your-api-key
+REACHY_MINI_REASONING_MODEL=gpt-6-astra
+REACHY_MINI_REASONING_EFFORT=medium
+REACHY_MINI_REASONING_GROUNDING_FILE="docs/Grounding Doc/ari-02-reasoner-playbook.md"
+REACHY_MINI_REASONING_WEB_SEARCH=true
+```
 
-Set `REACHY_MINI_REASONING_MODEL` and `REACHY_MINI_REASONING_EFFORT` in `.env`,
-then restart the app. Defaults are `gpt-6-astra` and `medium`. The chosen model
-must support the Responses API, structured outputs, and the selected effort.
-[GPT-6 Astra supports](https://developers.openai.com/api/docs/models/gpt-6-astra)
-`low`, `medium`, `high`, `xhigh`, and `max`. Higher effort can take longer and use
-more tokens; it does not increase this app's timeout or output-token cap below.
-The app also accepts `none` and `minimal` for models that support those values.
-Blank or invalid effort settings fall back to `medium`; invalid values log a warning.
-Startup logs show the chosen model and effort. No extra package or voice model is required.
+Use a model that supports the Responses API, structured output, the selected
+reasoning effort and, when enabled, the `web_search` tool. Existing model choices
+in `.env` are preserved. API usage and web searches are billed to the API account;
+ChatGPT subscriptions do not cover them. Search is enabled by default for the
+advisor; set `REACHY_MINI_REASONING_WEB_SEARCH=false` to disable internet access.
+The advisor can still reason from its knowledge and the supplied context. No
+additional dependency is needed.
 
-The worker batches updates for 0.75 seconds, runs one request at a time, and starts
-requests at least 5 seconds apart. Updates arriving during inference are combined
-into the next request. It sends up to 24 recent utterances and 24,000 transcript
-characters (up to 4,000 per utterance); older conversation is not retained by this
-worker. Requests have a 45-second timeout and a 3,000-token output cap including
-reasoning tokens. Each completed user or assistant utterance can cause another
-request, so API costs accumulate during conversation. Failures wait at least 15
-seconds before another pending update is processed.
+Restart the conversation app after changing configuration or the reasoner playbook:
 
-Results overtaken by a newer user utterance are discarded. A delivered note is
-labeled with its source question and remains available for the next user turn;
-Ari is instructed to ignore it if the topic has changed. It expires after another
-user turn or is replaced by new advice. Current notes update the conversation
-instructions without forcing a new reply, interrupting speech, or changing Ari's
-personality. They take effect on a subsequent model response; speech already
-being generated cannot be changed. The fast model keeps helping and clarifying
-while the advisor runs. Missing keys, unreadable tutor documents, timeouts, or API
-errors leave the voice conversation available and produce a warning.
+```bash
+source .venv/bin/activate
+reachy-mini-conversation-app --no-camera --ui
+```
 
-Enabling this sends text transcripts and both grounding documents to OpenAI;
-returned advisory notes are sent to the Hugging Face conversation service.
-The worker sends no microphone audio or camera images to OpenAI, uses
-`store=False`, and keeps its transcript window in memory. This setting is not a
-promise of zero provider retention. It neither browses nor executes robot tools;
-text in the tutor document alone does not implement camera controls or a silence
-timer. Restart after editing the tutor document. Set
-`REACHY_MINI_REASONING_ENABLED=false` and restart to disable the advisor.
+When launching through the desktop app, instance-local `.env` and saved personality
+settings can override the checkout's configuration. Select Ari in the UI if a
+previously saved personality is active. Startup logs identify the selected profile
+and advisor model. A missing key or unreadable playbook disables the advisor and
+logs the reason; voice conversation remains available. A missing configured shop
+document still prevents an ungrounded voice session from starting.
+
+#### Conversation flow
+
+1. The voice model handles small talk and established shop facts directly. For a
+   substantive question beyond the local documents, uncertainty, or a complex
+   question, `research_question` queues work and returns immediately.
+2. Ari acknowledges the actual question and may offer a known fact or one useful
+   clarification while the advisor works. A clear question does not need a
+   clarification before research starts. Ari should not redirect general topics
+   to laser cutting, repeat waiting announcements, or manufacture conversation.
+3. The advisor can search sources appropriate to any topic. The voice tool sets
+   `search_web=true` for explicit lookups, current information, or requested
+   sources; this requires a web-search call when search is enabled. Other requests
+   allow the advisor to choose whether to search. A materially changed question
+   replaces and cancels the previous request. Identical requests within a user
+   turn are deduplicated.
+4. Results update the voice instructions without interrupting a response. If the
+   student has not started another turn, Ari can continue after the active response,
+   estimated queued speaker audio, and a two-second quiet interval. The final sender
+   checks again for new speech before sending that continuation.
+5. If another user turn has already occurred, the note stays available for a relevant
+   natural reply, without forcing a return to the old topic. The model must check
+   relevance against the latest conversation. Notes expire after more than four
+   further user turns. A completed audio response that had access to a note consumes
+   it; this records exposure, not proof that the model used it.
+
+While the advisor is available, the voice session replaces its bundled direct web
+and knowledge lookup tools with the immediate research handoff. Robot tools keep
+working. If the advisor is disabled, the original lookup tools remain available.
+The conversation screen shows **Research ready**, **Research running**, and
+**Research complete · web searched** (or **no web search used**), plus the model
+and actionable errors. The completed status counts actual search calls, even
+when the response contains no citation. Clickable citations come from API
+annotations. Status and source links are also available through `conversation.research`.
+They are not read aloud. The live reference panel covers the current session;
+the experiment archive retains research results and citations across sessions.
+
+The worker batches requests for 0.75 seconds, starts requests at least five seconds
+apart, and runs one inference at a time. It sends at most 24 utterances and 24,000
+transcript characters, capped at 4,000 characters per utterance. Each inference
+has a 45-second timeout and a 6,000-token output cap including reasoning. Failures
+leave conversation running and publish an unavailable state. A new explicit request
+can retry after a minimum 15-second cooldown; there is no automatic paid retry loop.
+The result contains at most two 600-character snippets, one next question, and uncertainty.
+
+The archive records `research_setup` with the configured model, search availability,
+or a setup failure reason. `research_tool_available` confirms whether the voice
+session has the handoff tool. Logs connect queued, started, ready, expired and
+response-exposure events using `research_id`, with source turn, result age, elapsed
+inference time, and the actual `web_search_calls` count in `research_response`. Publication
+success means the update was sent, not that the remote model used it. Speech latency
+logs measure from completed transcription, not from microphone input to physical
+speaker playback. Actual fluency and model tool selection still require a live check.
+
+Enabling research sends the question, recent text transcripts and both grounding
+documents to OpenAI; returned notes and citations go to the Hugging Face service.
+Search queries may be generated from that context. The advisor receives no camera
+images or microphone audio, uses `store=False`, and keeps history in memory. This
+is not a promise of zero provider retention. It cannot operate hardware.
+
+To test general research, say: **"Look up the Yom Kippur War and explain its causes
+for my diorama."** Ari should acknowledge that subject, start research, and stay
+available for conversation. Watch for **Research running**, then **Research complete
+· web searched** and source links. Leave a quiet pause for Ari to work the answer
+into the conversation. Also try a complex laser question, such as why a test cut
+is incomplete only in some areas. Interrupting or changing topics should not cause
+a research result to interrupt speech or force a return to the old topic.
+
+If research never starts, check the downloaded archive: `research_setup` with
+`enabled: false` indicates a configuration problem; `research_failed` indicates
+an upstream request failed. If setup and tool availability are enabled but there
+is no `research_requested`, the voice model did not call the tool. Ensure Ari is
+selected, restart after prompt changes, and try an explicit lookup. A
+`research_response` with `web_search_calls: 0` means the advisor answered without
+using web search, regardless of what it said conversationally.
+
+### Experiment data
+
+Text recording is automatic. The Talk screen shows the recording status and saved
+size, with **Download data** and **Clear data…** controls. Downloading copies the
+archive without stopping recording. Clearing requires confirmation, erases the
+saved archive, and leaves recording active for new events. There is no automatic
+rotation, expiry, or deletion; app restarts keep appending to the same file.
+
+The file is `experiment.jsonl.gz`, alongside the app's memory file in its persistent
+instance directory. In terminal mode without an instance path, it is under
+`$XDG_DATA_HOME/reachy_mini_conversation_app/`, or
+`~/.local/share/reachy_mini_conversation_app/` when that variable is unset. Hover
+over the recording status to see the actual path. Recording works without the UI.
+For copy-and-paste export commands, see [Download data from Terminal](#download-data-from-terminal).
+
+Each JSON line contains schema version `v`, UTC Unix time in milliseconds `t`,
+session ID `s`, and event type `e`. Event-specific fields retain user transcripts,
+operator text, generated assistant text, response completion/interruption status,
+tool calls/results, and research requests, results, sources, timings, and failures.
+Research IDs link requests to results within a session. Generated text is not proof
+that all those words reached the speaker; cancelled replies retain available partial
+transcripts. A disconnected session retains available assistant text too.
+
+To keep files compact, the recorder stores UTF-8 text with compact JSON and maximum
+gzip compression. It excludes raw audio, camera images, token-by-token duplicates,
+private model reasoning, and repeated system prompts. It uses complete gzip members
+per event so ordinary restarts can append without rewriting old data; standard gzip
+readers, Python and pandas read all members. Compression and writes run on a separate
+worker to keep disk work off the voice loop. File errors appear in the Talk status
+and app logs. A forced process or machine crash can lose events still queued for writing.
+The archive contains participant speech as text and stays on the app's host unless
+you download or share it. Clearing long-term memory does not clear this archive.
+
+For analysis, Python's standard library can stream the file without extra packages:
+
+```python
+import gzip
+import json
+
+with gzip.open("experiment.jsonl.gz", "rt", encoding="utf-8") as archive:
+    for line in archive:
+        event = json.loads(line)
+        if event["e"] in ("input", "response"):
+            print(event["s"], event["t"], event["e"], event.get("text", ""))
+```
+
+Downloads use bounded chunks of a fixed file snapshot; new entries remain in the
+live archive for the next download. Clearing during a download invalidates it,
+instead of mixing old and new records. The same actions are available to clients
+through `experiment.log` with `action: "status"`, `"read"`, or `"clear"` (the last
+requires `confirm: true`).
 
 ### Hugging Face Connection Modes
 
@@ -261,18 +367,131 @@ HF_REALTIME_WS_URL=ws://127.0.0.1:8765/v1/realtime
 
 In the web UI's Settings view, the Connection section lets you choose either the built-in server or a local `host:port` target. The UI writes `HF_REALTIME_CONNECTION_MODE` for you, and the local path writes `HF_REALTIME_WS_URL` with a default of `localhost:8765`.
 
+
 ## Running the app
 
-Activate your virtual environment, then launch:
+### Start this laser-cutting experiment from Terminal
+
+On this Mac, first open the Reachy Mini desktop app and connect the robot. Its
+robot service (daemon) must be running. If the conversation app is already running
+there or in another terminal, stop that conversation instance before starting this one.
+Keep the robot service running.
+
+Paste these commands into Terminal:
 
 ```bash
-reachy-mini-conversation-app
+cd "/Users/adityade/Documents/ITP/Aaram/version 1"
+source .venv/bin/activate
+reachy-mini-conversation-app --no-camera --ui
 ```
 
-> [!TIP]
-> Make sure the Reachy Mini daemon is running before launching the app. If you see a `TimeoutError`, it means the daemon isn't started. See [Reachy Mini's SDK](https://github.com/pollen-robotics/reachy_mini/) for setup instructions.
+These commands use the existing environment and `.env` in this checkout. For a
+fresh installation, complete [Installation](#installation) and
+[Ari's background research configuration](#aris-background-research) first. On
+another computer, replace the `cd` path with your checkout's location. The shell
+examples use macOS/Linux syntax; in Windows PowerShell, activate the environment
+with `.venv\Scripts\Activate.ps1`.
 
-The app runs in console mode. Add `--ui` to serve the web interface at http://127.0.0.1:7860/.
+Keep this terminal open while talking to Ari. The camera is disabled for this
+experiment. Open [the Talk screen](http://127.0.0.1:7860/) to see research references
+and recording status; the browser is optional. After the session connects, check
+the terminal for the Ari profile and the "Background reasoning enabled" message.
+If the advisor is disabled, its log message explains which setting is missing.
+
+Press **Control+C** in this terminal to stop the app. Starting it again with the
+same commands continues adding to the existing experiment archive.
+
+If the command is missing, activate `.venv` and check the installation steps. A
+robot connection `TimeoutError` usually means the robot service is unavailable.
+If port `7860` is already in use, stop the earlier app instance before relaunching.
+
+### Download data from Terminal
+
+**Simplest option: copy the archive after stopping the app.** Press Control+C in
+the app terminal and wait for it to exit. Then run this in Terminal:
+
+```bash
+aaram_log="${XDG_DATA_HOME:-$HOME/.local/share}/reachy_mini_conversation_app/experiment.jsonl.gz"
+mkdir -p "$HOME/Downloads"
+cp -i "$aaram_log" "$HOME/Downloads/aaram-experiment-$(date +%Y%m%d-%H%M%S).jsonl.gz"
+```
+
+The copy appears in **Downloads** with the date and time in its filename. The
+original remains in place, and the next app run keeps appending to it. This path
+matches the terminal launch above. If you launched through the desktop app, use
+the actual archive path shown when hovering over the Talk screen's recording
+status. A "No such file" error means no archive has been recorded at that path yet.
+
+**To download while the conversation keeps running**, leave the first terminal
+open and open a second Terminal window. This version asks the running app for a
+complete snapshot, so new recording can continue safely. It needs the `--ui`
+option from the startup command, but does not need an open browser.
+
+```bash
+cd "/Users/adityade/Documents/ITP/Aaram/version 1"
+source .venv/bin/activate
+python - <<'PY'
+import base64
+import json
+from datetime import datetime
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from websockets.sync.client import connect
+
+with connect("ws://127.0.0.1:7860/rpc", proxy=None) as socket:
+    def request(params):
+        socket.send(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "experiment.log", "params": params}))
+        while True:
+            reply = json.loads(socket.recv(timeout=30))
+            if reply.get("id") == 1:
+                if "error" in reply:
+                    raise RuntimeError(reply["error"]["message"])
+                return reply["result"]
+
+    snapshot = request({"action": "status"})
+    if snapshot["error"]:
+        raise SystemExit(snapshot["error"])
+    if not snapshot["bytes"]:
+        raise SystemExit("No recorded data yet. Start a conversation, then try again.")
+
+    downloads = Path.home() / "Downloads"
+    downloads.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    destination = downloads / f"aaram-experiment-{stamp}.jsonl.gz"
+    with TemporaryDirectory(prefix="aaram-download-", dir=downloads) as folder:
+        temporary = Path(folder) / "experiment.jsonl.gz"
+        with temporary.open("wb") as output:
+            offset = 0
+            while offset < snapshot["bytes"]:
+                chunk = request({"action": "read", "offset": offset,
+                                 "limit": snapshot["bytes"], "generation": snapshot["generation"]})
+                if chunk["next_offset"] <= offset:
+                    raise RuntimeError("Download stopped. Please try again.")
+                output.write(base64.b64decode(chunk["content"], validate=True))
+                offset = chunk["next_offset"]
+        temporary.replace(destination)
+
+print(f"Saved {snapshot['bytes']:,} bytes to {destination}")
+print("Recording continues. The original archive has not been cleared.")
+PY
+```
+
+This uses the app's installed dependencies; no extra package is needed. It prints
+the saved file's full path. If the connection is refused, check that the app is
+running with `--ui` in the first terminal. If someone clears the log during export,
+the download fails cleanly; run the command again to download the new archive.
+
+Both methods retain the compact `.jsonl.gz` format. To inspect a downloaded file,
+replace the example filename below with the saved path:
+
+```bash
+gzip -t "$HOME/Downloads/aaram-experiment-YYYYMMDD-HHMMSS.jsonl.gz"
+gzip -dc "$HOME/Downloads/aaram-experiment-YYYYMMDD-HHMMSS.jsonl.gz" | less
+```
+
+`gzip -t` prints nothing when the archive is valid. In `less`, press **q** to exit.
+Neither command changes the saved file. Downloading never clears the live archive;
+use **Clear data…** on the Talk screen only when you want to erase the saved history.
 
 ### CLI options
 

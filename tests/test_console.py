@@ -885,6 +885,7 @@ async def test_play_loop_pushes_mono_audio_as_float32() -> None:
     """A mono int16 frame is pushed to the speaker as float32."""
     robot = _audio_robot(push_audio_sample=MagicMock())
     handler = MagicMock()
+    handler.playback_until = 0.0
     stream = LocalStream(handler, robot)
     handler.emit = AsyncMock(side_effect=_stop_after(stream, (24000, np.zeros(4, dtype=np.int16))))
 
@@ -901,6 +902,7 @@ async def test_play_loop_downmixes_stereo_before_pushing() -> None:
     """A stereo frame is reduced to a single mono channel before playback."""
     robot = _audio_robot(push_audio_sample=MagicMock())
     handler = MagicMock()
+    handler.playback_until = 0.0
     stream = LocalStream(handler, robot)
     stereo = np.zeros((4, 2), dtype=np.int16)
     handler.emit = AsyncMock(side_effect=_stop_after(stream, (24000, stereo)))

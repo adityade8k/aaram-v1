@@ -50,6 +50,7 @@ from reachy_mini_conversation_app.tools.core_tools import (
 )
 from reachy_mini_conversation_app.background_reasoning import BackgroundReasoner, create_background_reasoner
 from reachy_mini_conversation_app.conversation_handler import ConversationHandler
+from reachy_mini_conversation_app.tools.research_question import ResearchQuestion
 from reachy_mini_conversation_app.tools.background_tool_manager import (
     ToolCallRoutine,
     ToolNotification,
@@ -65,6 +66,12 @@ logger = logging.getLogger(__name__)
 
 _RESPONSE_DONE_TIMEOUT: Final[float] = 30.0
 _RESPONSE_REJECTION_RETRY_DELAY: Final[float] = 0.5
+_RESEARCH_QUIET_SECONDS: Final[float] = 2.0
+_RESEARCH_TOOL_NAMES = {
+    "pollen_robotics_reachy_mini_search_tool__search_web",
+    "pollen_robotics_reachy_mini_knowledge_tool__get_info",
+    "pollen_robotics_reachy_mini_knowledge_tool__search_docs",
+}
 
 
 class InputTranscriptChunksByItem(BaseModel):
@@ -127,7 +134,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         startup_voice: Optional[str] = None,
     ):
         """Initialize the handler."""
-        super().__init__()
+        super().__init__(instance_path)
 
         self.deps = deps
 
@@ -137,6 +144,15 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
         self.instance_path = instance_path
         self._reasoner: BackgroundReasoner | None = None
+        self._instruction_lock = asyncio.Lock()
+        self._research_followup_task: asyncio.Task[None] | None = None
+        self._published_advice_id = 0
+        self._response_advice_id = 0
+        self._response_had_audio = False
+        self._response_interrupted = False
+        self._user_speaking = False
+        self._user_speech_serial = 0
+        self._assistant_text: dict[str, str] = {}
         self._voice_override: str | None = self._normalize_startup_voice(startup_voice)
         self._realtime_connect_query: dict[str, str] = {}
 
@@ -248,7 +264,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     voice=self.get_current_voice(),
                 ),
             ),
-            tools=to_realtime_tools_config(tool_specs),
+            tools=to_realtime_tools_config(self._conversation_tool_specs(tool_specs)),
             tool_choice="auto",
         )
 
@@ -299,18 +315,84 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         voice = self._voice_override or get_session_voice(default=default_voice)
         return self._resolve_backend_voice(voice, source="session voice", fallback=default_voice) or default_voice
 
+    def _conversation_tool_specs(self, specs: list[ToolSpec]) -> list[ToolSpec]:
+        if self._reasoner is None:
+            return [spec for spec in specs if spec["name"] != ResearchQuestion.name]
+        specs = [spec for spec in specs if spec["name"] not in _RESEARCH_TOOL_NAMES | {ResearchQuestion.name}]
+        return [*specs, ResearchQuestion().spec()]
+
+    def research_status(self) -> dict[str, object]:
+        """Return the current advisor status and source links."""
+        if self._reasoner is None:
+            return {
+                "status": "disabled",
+                "snippets": [],
+                "sources": [],
+                "error": "Background research is unavailable. Check the app's reasoning configuration and startup logs.",
+            }
+        return self._reasoner.research_status
+
     async def refresh_instructions(self) -> bool:
-        """Push freshly built instructions to the live session, if there is one."""
-        if self.connection is None:
-            return False
-        await self.connection.session.update(
-            session=RealtimeSessionCreateRequestParam(
-                type="realtime",
-                instructions=self._get_live_instructions(),
-            ),
-        )
-        logger.info("Refreshed session instructions")
-        return True
+        """Push freshly built instructions and available tools to the live session."""
+        async with self._instruction_lock:
+            if self.connection is None:
+                return False
+            advice_id = self._reasoner.advice_id if self._reasoner is not None else 0
+            await self.connection.session.update(
+                session=RealtimeSessionCreateRequestParam(
+                    type="realtime",
+                    instructions=self._get_live_instructions(),
+                    tools=to_realtime_tools_config(self._conversation_tool_specs(get_tool_specs())),
+                ),
+            )
+            self._published_advice_id = advice_id
+            logger.info("Refreshed session instructions: research_id=%d", advice_id)
+            return True
+
+    async def _publish_research(self) -> bool:
+        sent = await self.refresh_instructions()
+        self._mark_activity("research_updated")
+        reasoner = self._reasoner
+        if self._research_followup_task is not None:
+            self._research_followup_task.cancel()
+            await asyncio.gather(self._research_followup_task, return_exceptions=True)
+            self._research_followup_task = None
+        if (
+            sent
+            and reasoner is not None
+            and reasoner.advice_id
+            and reasoner.advice_user_turn == reasoner.user_turn
+            and reasoner.research_status["snippets"]
+        ):
+            self._research_followup_task = asyncio.create_task(
+                self._resume_after_research(reasoner.advice_id, reasoner.user_turn, self._user_speech_serial),
+                name="research-followup",
+            )
+        return sent
+
+    async def _resume_after_research(self, advice_id: int, user_turn: int, speech_serial: int) -> None:
+        while self.connection is not None and self._reasoner is not None:
+            if (
+                self._reasoner.advice_id != advice_id
+                or self._reasoner.user_turn != user_turn
+                or self._user_speech_serial != speech_serial
+            ):
+                return
+            if (
+                not self._user_speaking
+                and self._response_done_event.is_set()
+                and not self._in_flight_tool_calls
+                and self._pending_responses.empty()
+                and self.output_queue.empty()
+                and time.monotonic() >= max(self.playback_until, self.last_activity_time) + _RESEARCH_QUIET_SECONDS
+            ):
+                await self._safe_response_create(
+                    _research_id=advice_id,
+                    _research_turn=user_turn,
+                    _research_speech=speech_serial,
+                )
+                return
+            await asyncio.sleep(0.1)
 
     async def apply_personality(self, profile: str | None) -> str:
         """Apply a personality to the active or next realtime connection."""
@@ -473,6 +555,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             },
         )
         self._mark_activity("say")
+        self.experiment_log.record("input", {"role": "operator", "text": text})
         await self._safe_response_create()
 
     async def _send_startup_greeting_prompt(self) -> None:
@@ -500,6 +583,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             )
             self._startup_greeting_sent = True
             self._mark_activity("startup_greeting_prompt")
+            self.experiment_log.record("input", {"role": "system", "text": greeting_prompt})
             await self._safe_response_create()
             logger.info("Queued startup greeting prompt")
         except Exception as e:
@@ -527,10 +611,16 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             # Parallel tool calls enqueue duplicate empty requests; coalesce to one.
             while not kwargs and not self._pending_responses.empty():
                 try:
-                    self._pending_responses.get_nowait()
+                    queued = self._pending_responses.get_nowait()
+                    if queued:
+                        self._pending_responses.put_nowait(queued)
+                        break
                 except asyncio.QueueEmpty:
                     break
 
+            research_id = kwargs.pop("_research_id", 0)
+            research_turn = kwargs.pop("_research_turn", 0)
+            research_speech = kwargs.pop("_research_speech", 0)
             sent = False
             max_retries = 5
             attempts = 0
@@ -547,6 +637,24 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 if not self.connection:
                     break
 
+                if research_id:
+                    if (
+                        self._reasoner is None
+                        or self._reasoner.advice_id != research_id
+                        or self._reasoner.user_turn != research_turn
+                        or self._user_speech_serial != research_speech
+                        or self._user_speaking
+                    ):
+                        break
+                    kwargs = {
+                        "response": {
+                            "instructions": self._get_live_instructions()
+                            + "\nContinue the unresolved research question naturally in one or two sentences. "
+                            "Connect the finding to what the student described. Do not announce a report or repeat a question.",
+                            "tool_choice": "none",
+                        }
+                    }
+                    logger.info("Research continuation queued for speech: research_id=%d", research_id)
                 self._last_response_rejected = False
                 self._response_started_or_rejected_event.clear()
                 try:
@@ -616,6 +724,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             )
             tool_result = {"error": "No result returned from tool execution"}
             tool_result_for_model = tool_result
+
+        self.experiment_log.record(
+            "tool_result",
+            {"call_id": completed_tool.id, "name": completed_tool.tool_name, "result": tool_result_for_model},
+        )
 
         # Connection may have closed while tool was running
         if not self.connection:
@@ -730,6 +843,17 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if self._realtime_connect_query:
             connect_kwargs["extra_query"] = self._realtime_connect_query
         async with self.client.realtime.connect(**connect_kwargs) as conn:
+            self.experiment_log.session_id = uuid.uuid4().hex
+            self._assistant_text.clear()
+            self._user_speaking = False
+            self.experiment_log.record(
+                "session_start",
+                {
+                    "backend": "huggingface",
+                    "profile": config.REACHY_MINI_CUSTOM_PROFILE,
+                    "voice": self.get_current_voice(),
+                },
+            )
             try:
                 session_config = self._get_session_config(tool_specs)
                 await conn.session.update(session=session_config)
@@ -756,9 +880,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
             response_sender_task: asyncio.Task[None] | None = None
             try:
-                self._reasoner = create_background_reasoner(self.refresh_instructions)
+                self._reasoner = create_background_reasoner(self._publish_research, experiment_log=self.experiment_log)
+                self.deps.request_research = self._reasoner.request if self._reasoner is not None else None
                 if self._reasoner is not None:
                     await self.refresh_instructions()
+                self.experiment_log.record("research_tool_available", {"enabled": self._reasoner is not None})
+                self._mark_activity("research_updated")
 
                 # Start the background tool manager
                 self.tool_manager.start_up(tool_callbacks=[self._handle_tool_result])
@@ -771,6 +898,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     logger.debug("Realtime event: %s", event.type)
                     if event.type == "input_audio_buffer.speech_started":
                         self._mark_activity("user_speech_started")
+                        self._user_speaking = True
+                        self._user_speech_serial += 1
+                        self._response_interrupted = True
+                        self.experiment_log.record("speech_started", {})
                         self._turn_user_done_at = None
                         self._turn_response_created_at = None
                         self._turn_first_audio_at = None
@@ -781,6 +912,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                     if event.type == "input_audio_buffer.speech_stopped":
                         self._mark_activity("user_speech_stopped")
+                        self._user_speaking = False
                         self.deps.movement_manager.set_listening(False)
                         logger.debug("User speech stopped - server will auto-commit with VAD")
 
@@ -789,13 +921,21 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         logger.debug("response completed")
 
                     if event.type == "response.output_text.delta":
-                        logger.debug("response text delta")
+                        self._assistant_text[event.item_id] = self._assistant_text.get(event.item_id, "") + event.delta
 
                     if event.type == "response.output_text.done":
                         logger.debug("response text done: %s", event.text)
+                        self._assistant_text[event.item_id] = event.text
+
+                    if event.type == "response.output_audio_transcript.delta":
+                        self._assistant_text[event.item_id] = self._assistant_text.get(event.item_id, "") + event.delta
 
                     if event.type == "response.created":
                         self._mark_activity("response_created")
+                        self._response_advice_id = self._published_advice_id
+                        self._response_had_audio = False
+                        self._response_interrupted = False
+                        self.experiment_log.record("response_started", {"research_id": self._response_advice_id})
                         self.deps.movement_manager.set_speaking(True)
                         self._response_done_event.clear()
                         self._response_started_or_rejected_event.set()
@@ -811,6 +951,23 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self.deps.movement_manager.set_speaking(False)
                         self._response_done_event.set()
                         self._response_started_or_rejected_event.set()
+                        self.experiment_log.record(
+                            "response",
+                            {
+                                "text": "\n".join(self._assistant_text.values()),
+                                "status": event.response.status,
+                                "interrupted": self._response_interrupted,
+                                "research_id": self._response_advice_id,
+                            },
+                        )
+                        self._assistant_text.clear()
+                        if (
+                            self._reasoner is not None
+                            and self._response_had_audio
+                            and not self._response_interrupted
+                            and event.response.status == "completed"
+                        ):
+                            self._reasoner.consume(self._response_advice_id)
                         logger.debug("Response done")
 
                     if event.type == "conversation.item.input_audio_transcription.delta":
@@ -836,6 +993,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     # Handle completed transcription (user finished speaking)
                     if event.type == "conversation.item.input_audio_transcription.completed":
                         self._mark_activity("user_transcription_completed")
+                        self._user_speaking = False
                         raw_transcript = event.transcript or ""
                         transcript = raw_transcript.strip()
                         logger.debug("User transcript: %s", raw_transcript)
@@ -855,6 +1013,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                         await self.output_queue.put(AdditionalOutputs({"role": "user", "content": transcript}))
                         self._emit_transcript("user", transcript, True)
+                        self.experiment_log.record("input", {"role": "user", "text": transcript})
                         if self._reasoner is not None:
                             self._reasoner.observe("user", transcript)
 
@@ -866,11 +1025,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             AdditionalOutputs({"role": "assistant", "content": event.transcript})
                         )
                         self._emit_transcript("assistant", event.transcript or "", True)
+                        self._assistant_text[event.item_id] = event.transcript or ""
                         if self._reasoner is not None:
                             self._reasoner.observe("assistant", event.transcript or "")
 
                     # Handle audio delta
                     if event.type == "response.output_audio.delta":
+                        self._response_had_audio = True
                         decoded_pcm_bytes = base64.b64decode(event.delta)
                         decoded_pcm = np.frombuffer(decoded_pcm_bytes, dtype=np.int16).reshape(1, -1)
                         self._mark_activity("assistant_audio_delta")
@@ -909,6 +1070,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             )
                             continue
 
+                        self.experiment_log.record(
+                            "tool_call", {"call_id": call_id, "name": tool_name, "arguments": args_json_str}
+                        )
+
                         self._in_flight_tool_calls.add(call_id)
                         background_tool = await self.tool_manager.start_tool(
                             call_id=call_id,
@@ -940,6 +1105,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         err = getattr(event, "error", None)
                         msg = getattr(err, "message", str(err) if err else "unknown error")
                         code = getattr(err, "code", "") or getattr(err, "type", "")
+                        self.experiment_log.record("error", {"code": code, "message": msg})
 
                         if code == "conversation_already_has_active_response":
                             # response.create was rejected.  The sender worker
@@ -964,6 +1130,17 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                                 AdditionalOutputs({"role": "assistant", "content": f"[error] {msg}"})
                             )
             finally:
+                if self._assistant_text:
+                    self.experiment_log.record(
+                        "response", {"text": "\n".join(self._assistant_text.values()), "status": "disconnected"}
+                    )
+                    self._assistant_text.clear()
+                self.deps.request_research = None
+                if self._research_followup_task is not None:
+                    self._research_followup_task.cancel()
+                    await asyncio.gather(self._research_followup_task, return_exceptions=True)
+                    self._research_followup_task = None
+                self._published_advice_id = 0
                 if self._reasoner is not None:
                     await self._reasoner.close()
                     self._reasoner = None
@@ -978,6 +1155,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                 # Stop background tool manager tasks (listener + cleanup) in all paths.
                 await self.tool_manager.shutdown()
+                self.experiment_log.record("session_end", {})
+                try:
+                    await self.experiment_log.access("status")
+                except OSError as exc:
+                    logger.warning("Could not check experiment log at session end: %s", exc)
 
     # Microphone receive
     async def receive(self, frame: Tuple[int, NDArray[np.int16]]) -> None:
@@ -1021,7 +1203,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         """Shutdown the handler."""
         # Unblock the response sender worker so it can exit
         self._response_done_event.set()
-
+        self.deps.request_research = None
+        if self._research_followup_task is not None:
+            self._research_followup_task.cancel()
+            await asyncio.gather(self._research_followup_task, return_exceptions=True)
+            self._research_followup_task = None
+        self._published_advice_id = 0
         if self._reasoner is not None:
             await self._reasoner.close()
             self._reasoner = None
