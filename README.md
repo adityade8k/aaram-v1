@@ -12,6 +12,12 @@ tags:
  - reachy_mini_python_app
 ---
 
+cd /Users/arampundik/dev/aaram-v1
+source .venv/bin/activate
+reachy-mini-conversation-app --ui
+
+
+
 # Reachy Mini conversation app
 
 Conversational app for the Reachy Mini robot combining realtime voice, vision, personality-aware tools, and choreographed motion.
@@ -146,7 +152,7 @@ For a wheel-only installation, provide an absolute path to your own document.
 This experiment gives Ari local expertise in laser cutting while keeping
 conversation open to any topic, including history, science, art, and project
 context. It uses the Hugging Face voice model for short conversation and a
-separate OpenAI advisor for questions beyond the local documents, uncertain
+separate Claude advisor for questions beyond the local documents, uncertain
 answers, complicated explanations, and web research. The voice model chooses the
 `research_question` tool when it needs help; there is no calibrated confidence
 score. Ordinary conversation alone does not start paid research requests.
@@ -155,7 +161,7 @@ score. Ordinary conversation alone does not start paid research requests.
 Reachy mic → Hugging Face conversation model → Reachy speaker
                      │ research_question         ↑
                      │ immediate acknowledgement │ brief at a conversational pause
-                     └→ OpenAI advisor + web search
+                     └→ Claude advisor + web search
 ```
 
 The advisor receives recent transcripts, the requested question, the shop context,
@@ -170,17 +176,18 @@ Configure the local `.env`:
 REACHY_MINI_CUSTOM_PROFILE=ari
 REACHY_MINI_GROUNDING_FILE="docs/Grounding Doc/ari-01-shop-context.md"
 REACHY_MINI_REASONING_ENABLED=true
-OPENAI_API_KEY=your-api-key
-REACHY_MINI_REASONING_MODEL=gpt-6-astra
+ANTHROPIC_API_KEY=your-api-key
+REACHY_MINI_REASONING_MODEL=claude-sonnet-5-5
 REACHY_MINI_REASONING_EFFORT=medium
 REACHY_MINI_REASONING_GROUNDING_FILE="docs/Grounding Doc/ari-02-reasoner-playbook.md"
 REACHY_MINI_REASONING_WEB_SEARCH=true
 ```
 
-Use a model that supports the Responses API, structured output, the selected
-reasoning effort and, when enabled, the `web_search` tool. Existing model choices
+Use a Claude model that supports the Messages API, the selected effort level
+and, when enabled, the `web_search` server tool (for example `claude-sonnet-5-5` or
+`claude-opus-5-5`). Existing model choices
 in `.env` are preserved. API usage and web searches are billed to the API account;
-ChatGPT subscriptions do not cover them. Search is enabled by default for the
+Claude.ai subscriptions do not cover them. Search is enabled by default for the
 advisor; set `REACHY_MINI_REASONING_WEB_SEARCH=false` to disable internet access.
 The advisor can still reason from its knowledge and the supplied context. No
 additional dependency is needed.
@@ -253,7 +260,7 @@ logs measure from completed transcription, not from microphone input to physical
 speaker playback. Actual fluency and model tool selection still require a live check.
 
 Enabling research sends the question, recent text transcripts and both grounding
-documents to OpenAI; returned notes and citations go to the Hugging Face service.
+documents to Anthropic; returned notes and citations go to the Hugging Face service.
 Search queries may be generated from that context. The advisor receives no camera
 images or microphone audio, uses `store=False`, and keeps history in memory. This
 is not a promise of zero provider retention. It cannot operate hardware.
@@ -298,7 +305,7 @@ that all those words reached the speaker; cancelled replies retain available par
 transcripts. A disconnected session retains available assistant text too.
 
 To keep files compact, the recorder stores UTF-8 text with compact JSON and maximum
-gzip compression. It excludes raw audio, camera images, token-by-token duplicates,
+gzip compression. It excludes raw audio, camera images (see [Session recording](#session-recording) for those), token-by-token duplicates,
 private model reasoning, and repeated system prompts. It uses complete gzip members
 per event so ordinary restarts can append without rewriting old data; standard gzip
 readers, Python and pandas read all members. Compression and writes run on a separate
@@ -325,6 +332,26 @@ live archive for the next download. Clearing during a download invalidates it,
 instead of mixing old and new records. The same actions are available to clients
 through `experiment.log` with `action: "status"`, `"read"`, or `"clear"` (the last
 requires `confirm: true`).
+
+### Session recording
+
+Set `REACHY_MINI_SESSION_RECORDING=true` to save speech and video for each session in
+`<start>_<id>/` folders under `REACHY_MINI_SESSION_RECORDING_DIR` (default: `sessions/` beside the experiment archive): `mic.wav` (participants),
+`assistant.wav` (what Ari says), `camera.mp4` with `camera.index.jsonl` (continuous
+robot-camera video at `REACHY_MINI_SESSION_RECORDING_FPS`, default 5), `transcript.txt`
+(readable text of what participants and Ari said, plus `TOOL` calls/results and every
+`REASONER` step: asked with its question and turn, started, answered with its advice,
+web-search count and duration, and whether Ari's reply could use it; mm:ss times from
+session start),
+and `meta.json`.
+Both WAVs start at session time zero (pauses are padded with silence), and every video
+frame carries a UTC millisecond timestamp on the same clock as `experiment.jsonl.gz`, so
+you can line up speech, video and logged events. Video is encoded live by ffmpeg
+(`brew install ffmpeg`); without it the app falls back to a very large raw
+`camera.mjpg` (about 10 GB/hour at 1080p). To sync an extra camera such
+as a phone, clap once on camera after the session starts; the clap shows in `mic.wav`
+and in the phone's audio. Recordings stay on the app host and are never cleared
+automatically; only record people who know about it.
 
 ### Hugging Face Connection Modes
 

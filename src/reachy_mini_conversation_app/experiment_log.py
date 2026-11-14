@@ -7,6 +7,7 @@ import asyncio
 import logging
 from typing import Literal
 from pathlib import Path
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 
 from reachy_mini_conversation_app.memory import memory_path_for_instance
@@ -26,6 +27,8 @@ class ExperimentLog:
         self.session_id = uuid.uuid4().hex
         self._generation = uuid.uuid4().hex
         self._error: str | None = None
+        # Optional live observer (the session recorder's readable transcript) given each event as it is recorded.
+        self.listener: Callable[[str, dict[str, object], int], None] | None = None
 
     def record(self, event: str, fields: dict[str, object]) -> None:
         """Queue an event with its capture time and session ID in arrival order."""
@@ -37,6 +40,11 @@ class ExperimentLog:
             logger.error("Could not encode experiment event %s: %s", event, exc)
             return
         _WRITER.submit(self._append, encoded)
+        if self.listener is not None:
+            try:
+                self.listener(event, fields, int(entry["t"]))  # type: ignore[call-overload]
+            except Exception:
+                logger.exception("Experiment log listener failed for %s", event)
 
     def _append(self, encoded: bytes) -> None:
         try:

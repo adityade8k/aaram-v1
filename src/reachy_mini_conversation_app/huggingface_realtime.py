@@ -43,6 +43,7 @@ from reachy_mini_conversation_app.prompts import (
     get_session_greeting_prompt,
 )
 from reachy_mini_conversation_app.streaming import AdditionalOutputs, audio_to_int16
+from reachy_mini_conversation_app.session_recorder import SessionRecorder
 from reachy_mini_conversation_app.tools.core_tools import (
     ToolSpec,
     ToolDependencies,
@@ -181,6 +182,34 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._startup_greeting_sent = False
         self._in_flight_tool_calls: set[str] = set()
         self._tool_batch_needs_response = False
+        self._recorder: SessionRecorder | None = None
+
+    def _start_session_recording(self) -> None:
+        """Begin speech + camera capture when enabled; failures never block the conversation."""
+        if not config.SESSION_RECORDING:
+            return
+        try:
+            media = getattr(self.deps.reachy_mini, "media", None)
+            frame_source = media.get_frame_jpeg if media is not None and self.deps.camera_enabled else None
+            self._recorder = SessionRecorder(
+                self.instance_path,
+                self.experiment_log.session_id,
+                frame_source=frame_source,
+                camera_fps=config.SESSION_RECORDING_FPS,
+            )
+            self.experiment_log.listener = self._recorder.log_event
+            self.experiment_log.record(
+                "recording_started", {"dir": self._recorder.directory.name, "camera": frame_source is not None}
+            )
+        except Exception:
+            logger.exception("Could not start session recording; continuing without it")
+            self._recorder = None
+
+    async def _stop_session_recording(self) -> None:
+        recorder, self._recorder = self._recorder, None
+        self.experiment_log.listener = None
+        if recorder is not None:
+            await asyncio.to_thread(recorder.close)
 
     @staticmethod
     def _sanitize_tool_result_for_model(tool_name: str, tool_result: dict[str, Any]) -> dict[str, Any]:
@@ -844,6 +873,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             connect_kwargs["extra_query"] = self._realtime_connect_query
         async with self.client.realtime.connect(**connect_kwargs) as conn:
             self.experiment_log.session_id = uuid.uuid4().hex
+            self._start_session_recording()
             self._assistant_text.clear()
             self._user_speaking = False
             self.experiment_log.record(
@@ -1039,6 +1069,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             self._turn_first_audio_at = time.perf_counter()
                             delta_ms = (self._turn_first_audio_at - self._turn_user_done_at) * 1000
                             logger.info("Turn latency: first audio delta %.0f ms after user transcript", delta_ms)
+                        if self._recorder is not None:
+                            self._recorder.record_assistant(self.SAMPLE_RATE, decoded_pcm)
                         await self.output_queue.put(
                             (
                                 self.SAMPLE_RATE,
@@ -1156,6 +1188,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 # Stop background tool manager tasks (listener + cleanup) in all paths.
                 await self.tool_manager.shutdown()
                 self.experiment_log.record("session_end", {})
+                await self._stop_session_recording()
                 try:
                     await self.experiment_log.access("status")
                 except OSError as exc:
@@ -1175,7 +1208,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if not self.connection:
             return
 
-        _, audio_frame = frame
+        mic_rate, audio_frame = frame
         if audio_frame.size == 0:
             return
 
@@ -1190,6 +1223,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
         # Cast if needed
         audio_frame = audio_to_int16(audio_frame)
+        if self._recorder is not None:
+            self._recorder.record_mic(int(mic_rate), audio_frame.reshape(-1))
 
         # Send to the realtime input buffer (guard against races during reconnect).
         try:
