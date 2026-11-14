@@ -22,6 +22,18 @@ reachy-mini-conversation-app --ui
 
 Conversational app for the Reachy Mini robot combining realtime voice, vision, personality-aware tools, and choreographed motion.
 
+> **Which API runs the background reasoner?** It depends on the branch:
+>
+> | Branch | Reasoner API | Key |
+> |---|---|---|
+> | `anthropic-reasoner` (this branch) | Anthropic (Claude, default `claude-sonnet-5-5`) | `ANTHROPIC_API_KEY` |
+> | `main` and Aditya's own branches | OpenAI | `OPENAI_API_KEY` |
+>
+> The realtime voice backend is the same on every branch: the Hugging Face
+> OpenAI-compatible server. Only the background research advisor differs.
+> Check which branch you are on before setting up `.env`; the settings in
+> `.env.example` match the branch they came from.
+
 ![Reachy Mini Dance](docs/assets/reachy_mini_dance.gif)
 
 ## Table of contents
