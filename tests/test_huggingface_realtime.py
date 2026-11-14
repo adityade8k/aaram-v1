@@ -218,9 +218,12 @@ async def test_audio_continues_during_reasoning_and_advice_updates_live_instruct
     async def infer(**kwargs):
         inference_started.set()
         await release_inference.wait()
-        return SimpleNamespace(status="completed", output_parsed=advice, output=[])
+        return SimpleNamespace(
+            stop_reason="end_turn",
+            content=[SimpleNamespace(type="text", text=advice.model_dump_json(), citations=None)],
+        )
 
-    advisor_client.responses.parse = AsyncMock(side_effect=infer)
+    advisor_client.messages.create = AsyncMock(side_effect=infer)
 
     def reasoner_factory(publish, **kwargs):
         return BackgroundReasoner(
@@ -1049,11 +1052,16 @@ async def test_research_continuation_waits_for_playback_and_user_speech(monkeypa
     monkeypatch.setattr(hf_mod, "_RESEARCH_QUIET_SECONDS", 0)
     client = MagicMock()
     client.close = AsyncMock()
-    client.responses.parse = AsyncMock(
+    client.messages.create = AsyncMock(
         return_value=SimpleNamespace(
-            status="completed",
-            output_parsed=ReasoningAdvice(snippets=["Finding"], next_question="", uncertainty=""),
-            output=[],
+            stop_reason="end_turn",
+            content=[
+                SimpleNamespace(
+                    type="text",
+                    text=ReasoningAdvice(snippets=["Finding"], next_question="", uncertainty="").model_dump_json(),
+                    citations=None,
+                )
+            ],
         )
     )
     handler = _plain_handler()
@@ -1120,11 +1128,16 @@ async def test_late_research_is_context_only_without_forcing_an_old_topic(monkey
     monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
     client = MagicMock()
     client.close = AsyncMock()
-    client.responses.parse = AsyncMock(
+    client.messages.create = AsyncMock(
         return_value=SimpleNamespace(
-            status="completed",
-            output_parsed=ReasoningAdvice(snippets=["Finding"], next_question="", uncertainty=""),
-            output=[],
+            stop_reason="end_turn",
+            content=[
+                SimpleNamespace(
+                    type="text",
+                    text=ReasoningAdvice(snippets=["Finding"], next_question="", uncertainty="").model_dump_json(),
+                    citations=None,
+                )
+            ],
         )
     )
     worker = BackgroundReasoner(client, "shop", "model", AsyncMock(return_value=True), debounce_seconds=0)
@@ -1193,17 +1206,25 @@ async def test_real_tool_handoff_returns_and_speaks_before_research_finishes(
     advisor_client.close = AsyncMock()
 
     async def infer(**kwargs):
-        assert question in kwargs["input"]
-        assert kwargs["tool_choice"] == ("required" if search_web else "auto")
+        prompt = kwargs["messages"][0]["content"]
+        assert question in prompt
+        assert ("must use web search" in prompt) is search_web
         started.set()
         await release.wait()
         return SimpleNamespace(
-            status="completed",
-            output_parsed=ReasoningAdvice(snippets=["Research finding"], next_question="", uncertainty=""),
-            output=[],
+            stop_reason="end_turn",
+            content=[
+                SimpleNamespace(
+                    type="text",
+                    text=ReasoningAdvice(
+                        snippets=["Research finding"], next_question="", uncertainty=""
+                    ).model_dump_json(),
+                    citations=None,
+                )
+            ],
         )
 
-    advisor_client.responses.parse = AsyncMock(side_effect=infer)
+    advisor_client.messages.create = AsyncMock(side_effect=infer)
     monkeypatch.setattr(
         hf_mod,
         "create_background_reasoner",

@@ -28,6 +28,9 @@ dependencies = [
     "mcp>=2.0,<3",
     "mcp-types>=2.0,<3",
     "httpx2>=2.5.0",
+
+    #Anthropic (background reasoning advisor)
+    "anthropic>=2.4.0",
 ]
 
 [dependency-groups]
