@@ -1,0 +1,2 @@
+Draft allocation for 16 eligible participants. Seed 20261117. Independently shuffled blocks of all eight sequence-by-mode cells. Assign in enrollment order; do not reassign after seeing outcomes. Proposed plan, not recorded recruitment.
+Version 0.2 uses inline/background architecture labels. These replace, and must not be pooled with, the former no-lookup OFF/ON design.

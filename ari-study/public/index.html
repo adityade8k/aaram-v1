@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#f6f7f2"><meta name="description" content="Ari voice assistant · ITP/IMA shop interaction pilot">
+  <title>Ari · Shop study</title><link rel="stylesheet" href="./style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="./index.html" aria-label="Ari home"><span class="brand-icon">a</span> ari<span class="brand-dot">.</span></a>
+  <div class="workspace-label">ITP / IMA SHOP</div>
+  <nav aria-label="Workspace">
+    <button class="nav-item active" data-view="conversation"><span>◉</span> Conversation</button>
+    <button class="nav-item" data-view="desk"><span>▦</span> Research desk</button>
+    <a class="nav-item" href="./protocol.html" target="_blank"><span>↗</span> Study protocol</a>
+  </nav>
+  <div class="sidebar-bottom"><span class="tiny-label">EXPLORATORY PILOT</span><p>Same assistant.<br>Different presence.</p><span class="pilot-tag"><i></i> Pilot 01</span></div>
+</aside>
+<main>
+  <header class="topbar"><span>Shop assistant <span class="slash">/</span> <strong id="view-name">Conversation</strong></span><span class="connection"><i id="connection-dot"></i><span id="connection-text">Ready to set up</span></span></header>
+  <div id="notice" class="notice" role="status" hidden></div>
+  <section id="conversation" class="page">
+    <div class="eyebrow">A CONVERSATION WITH ARI</div>
+    <div class="intro"><div><h1>A little space<br>to ask.</h1><p>Think through your project, one question at a time.</p></div><span class="voice-tag">VOICE ONLY <span>↗</span></span></div>
+    <div class="conversation-grid">
+      <section class="voice-card" aria-label="Voice conversation">
+        <div class="card-top"><span><i class="green-dot"></i> Ari · Shop assistant</span><span id="session-timer">00:00</span></div>
+        <div class="voice-stage" data-state="idle" id="voice-stage">
+          <div class="orbit orbit-one"></div><div class="orbit orbit-two"></div>
+          <div class="voice-orb"><div class="wave"><b></b><b></b><b></b><b></b><b></b></div></div>
+        </div>
+        <h2 id="voice-title">Let’s talk it through.</h2>
+        <p id="voice-caption">Your microphone starts when you begin.</p>
+        <div id="mode-label" class="preview-tag">SETUP REQUIRED</div>
+        <div class="voice-actions"><button id="start" class="button primary">Begin conversation <span>↗</span></button><button id="mute" class="button secondary" hidden>Mute microphone</button><button id="end" class="button end" hidden>End conversation</button></div>
+        <p class="voice-footnote">You can interrupt, ask again, or take a moment.</p>
+      </section>
+      <aside class="context-column">
+        <section class="task-card"><div class="eyebrow">YOUR STARTING POINT</div><span id="task-number" class="task-number">01 / PREPARATION</span><h2 id="task-title">Before the first cut.</h2><p id="task-description">Prepare a small project for a conversation with shop staff. Ask Ari whatever would help you work out your next step.</p><div class="task-rule">Keep the machine idle.<br>Staff make the final check.</div><button class="text-button" id="participant-view">Enter participant view ↗</button></section>
+        <section class="quiet-card"><span class="small-symbol">↔</span><h3>Room for uncertainty.</h3><p>You don’t need a perfect question. Start with what you’re trying to make.</p></section>
+      </aside>
+    </div>
+    <div class="bottom-note"><span>NYU TISCH · INTERACTIVE TELECOMMUNICATIONS</span><button class="text-button" data-view="desk">Open research desk →</button></div>
+  </section>
+  <section id="desk" class="page" hidden>
+    <div class="eyebrow">RESEARCHER WORKSPACE</div><div class="intro"><div><h1>Set the conditions.</h1><p>Two interfaces. One consistent session plan.</p></div><span class="pilot-tag">Interface-first pilot</span></div>
+    <div class="desk-grid"><section class="panel"><div class="panel-heading"><h2>Session setup</h2><span class="pill">Phone</span></div>
+      <form id="setup-form"><fieldset id="setup-fields">
+        <div class="form-row"><label>Participant code<input id="participant" value="P01" maxlength="32" pattern="[A-Za-z0-9_-]+" autocomplete="off"></label><label>Counterbalance sequence<select id="sequence"><option value="1">1 · Robot X → Phone Y</option><option value="2">2 · Phone X → Robot Y</option><option value="3">3 · Robot Y → Phone X</option><option value="4">4 · Phone Y → Robot X</option></select></label></div>
+        <label>Inference architecture</label><div class="segmented" role="group" aria-label="Inference architecture"><button type="button" data-mode="inline" class="selected" aria-pressed="true">Conversation model alone <small>Web search enabled</small></button><button type="button" data-mode="background" aria-pressed="false">With background researcher <small>Web search enabled</small></button></div>
+        <p class="field-help">Keep this setting the same for both interfaces for this participant. Both modes can search. The switch controls whether a separate researcher handles the result.</p>
+        <div class="form-row"><label>Phone task<select id="task"><option value="Y">Y · Project labels</option><option value="X">X · Exhibition sign</option><option value="practice">Practice · Materials conversation</option></select></label><label>Session engine<select id="engine"><option value="live">Live voice</option><option value="demo">Scripted preview · no microphone</option></select></label></div>
+        <label>Voice server <small>Leave blank when hosted together</small><input id="backend" type="url" placeholder="https://your-voice-server.example" autocomplete="off"></label>
+        <label>Study access code<input id="access-token" type="password" autocomplete="off" placeholder="Required on hosted servers"></label>
+        <label class="check"><input id="consent" type="checkbox"><span>I have obtained the required consent for this session and explained provider processing and transcript logging. Audio is streamed to the voice service; search queries go to the shared search provider in both modes. Background mode also sends recent text and sources to the research model. This app does not save audio.</span></label>
+      </fieldset><button class="button primary" type="submit">Use these settings <span>→</span></button></form>
+    </section><div><section class="panel compact"><div class="panel-heading"><h2>Current plan</h2><span class="pill">2 blocks</span></div><div id="plan"></div><div class="callout">Mode locks at session start. A new block creates a fresh model session.</div><p class="field-help">Robot blocks use the supplied robot client and the same server. Select inline or background when launching that client; this desk does not remotely start the robot.</p></section><section class="panel compact"><h2>Connection check</h2><p id="health-status">Check the server before a live session.</p><button class="button secondary" id="health-check">Check server</button><p class="field-help">Preview uses a fixed script. Never mix preview logs with participant data.</p></section></div></div>
+    <section class="panel log-panel"><div class="panel-heading"><div><div class="eyebrow">CURRENT / MOST RECENT BLOCK</div><h2>Session record</h2></div><div class="export-actions"><button id="export-json" class="button secondary">Export JSON</button><button id="export-csv" class="button secondary">Export CSV</button></div></div><p class="field-help">Saved in this browser after consent; export each block before starting another. Transcripts are researcher-only. A log of injection is not evidence that a finding was spoken.</p><div id="record-meta" class="record-meta">No session yet.</div><div id="events" class="event-list"><p class="empty">Conversation events will appear here.</p></div><div class="annotation-row"><label>Observer marker<select id="marker"><option>Clarification request</option><option>Speech recognition repair</option><option>Admission of confusion</option><option>Advice verification</option><option>Staff help</option><option>Pointing / assumed vision</option><option>Movement / device placement</option><option>Network issue</option></select></label><button id="add-marker" class="button secondary">Add marker</button></div><label>Observer notes<textarea id="observer-notes" rows="3" placeholder="Describe the observable event and context. Avoid names."></textarea></label><button id="save-notes" class="text-button">Save notes to this block →</button><details class="ratings"><summary>Post-condition ratings</summary><p class="field-help">Ask after each interface. 1 = strongly disagree; 7 = strongly agree. These are study-specific items, not a validated scale.</p><div id="ratings-fields"></div><button id="save-ratings" class="button secondary">Save ratings</button></details><button id="clear-record" class="text-button danger">Clear exported browser record</button></section>
+  </section>
+</main>
+<button id="exit-participant" class="researcher-return" hidden>Researcher view</button>
+<script defer src="./bundle.js"></script>
+</body></html>

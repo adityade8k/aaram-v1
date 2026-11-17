@@ -1,0 +1,14 @@
+import { cp, mkdir, rm, readFile, writeFile } from 'node:fs/promises';
+const documents={basePrompt:'assistant.md',grounding:'shop-context.md',playbook:'reasoner-playbook.md'};
+const exports=[];
+for(const [name,file] of Object.entries(documents))exports.push(`export const ${name} = ${JSON.stringify(await readFile(new URL('../shared/'+file,import.meta.url),'utf8'))};`);
+await writeFile(new URL('../server/knowledge.mjs',import.meta.url),exports.join('\n')+'\n');
+await rm(new URL('../dist/',import.meta.url),{recursive:true,force:true});
+await mkdir(new URL('../dist/',import.meta.url));
+await cp(new URL('../public/',import.meta.url),new URL('../dist/',import.meta.url),{recursive:true});
+const modules=[];
+for(const file of ['audio.js','study.js','app.js'])modules.push((await readFile(new URL('../public/'+file,import.meta.url),'utf8')).replace(/^import .*;\n/gm,'').replace(/^export /gm,''));
+const bundle='(()=>{\n'+modules.join('\n')+'\n})();\n';
+await writeFile(new URL('../public/bundle.js',import.meta.url),bundle);
+await writeFile(new URL('../dist/bundle.js',import.meta.url),bundle);
+console.log('Phone frontend built. Voice requires the Node server and configured provider access.');

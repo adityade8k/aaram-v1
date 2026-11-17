@@ -30,8 +30,8 @@ Conversational app for the Reachy Mini robot combining realtime voice, vision, p
 >
 > | Branch | Reasoner API | Key |
 > |---|---|---|
-> | `anthropic-reasoner` (this branch) | Anthropic (Claude, default `claude-sonnet-5-5`) | `ANTHROPIC_API_KEY` |
-> | `main` and Aditya's own branches | OpenAI | `OPENAI_API_KEY` |
+> | `anthropic-reasoner` | Anthropic (Claude, default `claude-sonnet-5-5`) | `ANTHROPIC_API_KEY` |
+> | `main` | OpenAI | `OPENAI_API_KEY` |
 >
 > The realtime voice backend is the same on every branch: the Hugging Face
 > OpenAI-compatible server. Only the background research advisor differs.
@@ -47,6 +47,7 @@ Conversational app for the Reachy Mini robot combining realtime voice, vision, p
 - [Installation](#installation)
 - [Configuration](#configuration)
 - [Running the app](#running-the-app)
+- [Phone and robot inference study](#phone-and-robot-inference-study)
 - [Download data from Terminal](#download-data-from-terminal)
 - [LLM tools](#llm-tools-exposed-to-the-assistant)
 - [Creating and adding tools](#creating-and-adding-tools)
@@ -785,3 +786,107 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow and [`AGENTS
 ## License
 
 Apache 2.0
+
+## Phone and robot inference study
+
+The `inferencetesting` branch adds an exploratory study client for both interfaces. The existing architecture diagram does not show this separate shared Node backend or its inline/background modes.
+
+Two audio clients share one study backend. Either client supports both inference architectures. The study clients live under `ari-study/`; the existing robot application remains available. Run the commands below from `ari-study/`.
+
+| Mode | Web access | Who interprets the sources? | Conversation behavior |
+| --- | --- | --- | --- |
+| inline | Enabled | Conversation model itself | May acknowledge before a lookup; gets real source excerpts on completion; microphone remains live |
+| background | Enabled through the same search service | Separate Claude researcher sends a brief to the voice model | Immediate tool acknowledgement allows useful dialogue while the researcher works |
+
+The background mode is the concurrent one. Neither mode is forced to remain silent or generate filler, and no synthetic inference delay is added. This compares architectures, not latency alone: an additional model can also change answer quality. Legacy on/off conditions are rejected rather than silently reinterpreted.
+
+### What changed
+
+- Both modes use the same `lookup_information` tool, shared search service and result budget. Inline never invokes the separate reasoning model.
+- Phone and robot receive the same model session configuration within each mode.
+- A new Reachy Mini client streams robot microphone/speaker audio and enables speech-reactive head movement. It does not reproduce every model-selected gesture in the old app.
+- Search completion, background processing, tool delivery, speech and cancellations are logged separately.
+- Background findings can re-enter naturally after follow-up turns. Delivery waits until the user and model are idle and a 750 ms quiet window has passed after reported playback/turn activity. This is a turn-taking safeguard, not a simulated inference delay.
+- The voice model can explicitly skip an unsolicited research follow-up if the topic changed, it was resolved, or the note is not useful. No extra spoken reply is requested for a skipped note. Results older than eight new turns or three minutes at delivery are discarded.
+- The protocol, UI, previews and allocation list use inline/background terminology. Old browser records remain accessible with their original labels.
+
+### Verification and remaining work
+
+The study checks cover 19 backend behaviors and three robot transport scenarios with simulated hardware; syntax checks are also provided. The robot client also loads in the existing Reachy Python environment. Tests cover direct search without a second model, background concurrency, shared phone/robot configuration, input during pending lookups, cancellation, failures, stale notes and exports.
+
+Real phone audio, the robot adapter, provider access and deployment remain unverified. A matching backend configuration does not prove matching audio latency or recognition on hardware.
+
+### Configure the shared server
+
+Use Node 24+. Copy `.env.example` to `.env` and configure values locally. Never put keys into public frontend files. Run `npm ci` inside `ari-study/` to install the pinned MIT-licensed ws dependency. No Python dependency changes are required for the existing robot environment.
+
+| Setting | Purpose |
+| --- | --- |
+| HF_REALTIME_WS_URL | Actual direct voice endpoint, or leave blank for the allocator used by the inspected robot |
+| HF_TOKEN / HF_HARDWARE_ID | Authorized provider token/actual registered hardware identity if required |
+| HF_VOICE | Default Aiden; both clients receive the same value |
+| REALTIME_TRANSCRIPTION_LANGUAGE | Default en; shared by both clients |
+| BRAVE_SEARCH_API_KEY | Required in both modes for the common search adapter |
+| ANTHROPIC_API_KEY | Required only in background mode |
+| REACHY_MINI_REASONING_MODEL | Explicit deployed researcher model ID; required only in background mode |
+| REACHY_MINI_REASONING_EFFORT | Default medium; verify compatibility with that model |
+| STUDY_ACCESS_TOKEN | Required for hosted/network access; enter the same code on the phone/client |
+| ALLOWED_ORIGINS | Exact frontend origin when frontend and voice backend are hosted separately |
+| HOST / PORT | Local defaults 127.0.0.1 / 4173 |
+
+The current raw-search adapter uses Brave Search, returning at most five source excerpts per request. It does not fetch full pages. The background researcher receives those same results and has no extra browsing tools. No account was created and no search subscription or provider charge was initiated. You can replace `server/search.mjs` with your existing search service while keeping the same bounded result contract for both modes.
+
+Run `npm run build`, then `npm start` from this folder, or use Start_Ari.command on macOS. Open http://127.0.0.1:4173 on the computer. The app refuses live sessions with missing required configuration; it never silently substitutes a different mode.
+
+### Phone client
+
+Open the app over HTTPS on a phone. In Research desk, set participant code, sequence, task and inference architecture. Both modes can search. Apply settings, complete the consent step, and begin. The participant view hides researcher metadata and transcripts. Export after every block. Leaving the page ends the block rather than silently resuming its memory later.
+
+The separately exported package's standalone `Ari_Phone_Preview.html` is a scripted demonstration without a microphone or live model. Its timing is illustrative and is not study evidence.
+
+### Robot client
+
+Use the existing working Reachy Python environment, with the compatible Reachy Mini SDK (the inspected checkout pins 1.12.0rc1), NumPy and websockets. Do not upgrade the robot SDK independently of its daemon. The new client has not been installed into the original app or tested on the robot.
+
+Stop the old conversation app before running this client. Leave the robot daemon running, with the robot awake and audio available. Run from this package's directory, using that environment's Python:
+
+```sh
+python robot/voice_client.py --server https://YOUR-STUDY-HOST --mode inline --participant P01 --task X --consent-confirmed
+```
+
+For the other mode, replace `--mode inline` with `--mode background`. Both use the same server-side voice/search configuration. Set STUDY_ACCESS_TOKEN in the client process environment; do not place it on the command line or in a URL. Optional flags select the robot name/host, media backend and output directory; `--help` lists them.
+
+The adapter uses the SDK's microphone, speaker, `enable_wobbling` and immediate `clear_player` for interruption. It reads or sends no images, performs no head tracking and provides no machine-control tools. Disable any separate camera/vision consumers in the robot setup. Speech-reactive motion is the pilot's initial gesture policy; confirm whether this matches the intended robot condition before recruiting.
+
+This initial adapter requires native 16 kHz input and output, matching the inspected voice loop. It reports unsupported media rates instead of silently changing speech timing. Validate this on your robot before use. The terminal reports startup/errors; Ctrl-C stops the session. Robot events and transcripts are saved as JSONL under `recordings/` or `--output`. They contain participant data and must not be put in a public deployment or source archive. The robot CLI does not provide the phone's mute button or rating form; document this control difference and collect robot ratings using the same paper questions.
+
+### Hosting
+
+The frontend can run on Netlify. The included Netlify Server entry supports `/api/*` and WebSockets on accounts with Server Early Access. Current Netlify documentation specifies Node 24+ and CLI 27.17+; confirm availability for the account. Build command: `npm run build`; publish directory: `dist`. Configure secrets in the server/Functions environment scope, then deploy. No catch-all static rewrite should swallow `/api/voice`.
+
+Alternatively host this Node server on the droplet behind an HTTPS reverse proxy with WebSocket support, put the frontend on Netlify, and configure its exact origin in ALLOWED_ORIGINS. Set HOST=0.0.0.0 and a study access code on a network server. Enter its HTTPS origin in the phone research desk and the robot's `--server` argument. A phone's normal browser microphone access will not work over an ordinary HTTP LAN IP.
+
+No deployment, droplet change or credential installation has been performed. Live sessions have a 25-minute limit, use fresh memory, and end on a connection loss. Exports and robot JSONL files are the study records; browser and hosting instance memory are not institutional archival storage.
+
+### Before collecting data
+
+- Confirm ethics/consent and staff review of the idle-machine preparation tasks and grounding document.
+- Verify both modes on both interfaces: a factual lookup should cause the shared search call, and only background should cause a second reasoning-model request.
+- Check real speech during pending calls, interruptions, and response-scoped tools for skipping irrelevant follow-ups. A prompt alone does not prove that a deployed voice backend supports continuing a turn during a tool wait.
+- Match service versions, voice, language, volume, practice and task time. Compare microphone recognition, speaker delay and movement on actual hardware.
+- Keep vision and cross-session memory out of both conditions. Confirm portability; use stationary tasks if the robot is tethered.
+- Obtain actual source/model identifiers and credentials. API access remains unverified.
+
+The first study remains interface-first: each participant tries robot and phone with one fixed inference architecture. The optional 16-person allocation has two people in each of eight sequence-by-architecture cells. It is exploratory, not a powered latency experiment.
+
+### Files and development
+
+- `study/Ari_Study_Protocol.md` and `public/protocol.html`: full draft with tasks, 40-minute procedure, ratings, interview questions, controls, analysis and data handling.
+- `public/task-cards.html`: printable preparation props and worksheet.
+- `study/allocation.csv` and `study/observations.csv`: allocation and observer templates.
+- `robot/voice_client.py`: robot audio frontend to the shared backend.
+- `robot/prompts/`: audit snapshots, not installable profiles for the old robot app.
+
+Edit shared/*.md, then `npm run build` to refresh the server prompt bundle and frontend. `node scripts/export-robot.mjs` regenerates the audit snapshots. Run `npm test`, `npm run check` and the robot syntax check after relevant changes. `python scripts/render_protocol.py` regenerates the printable protocol.
+
+Grounding was copied from the supplied Aaram checkout and still needs staff review. Participant data and provider secrets must remain out of Git. Official implementation references: https://api-dashboard.search.brave.com/app/documentation/web-search ; https://huggingface.co/docs/reachy_mini/API/reachymini ; https://huggingface.co/docs/reachy_mini/API/media ; https://docs.netlify.com/build/server/ .
