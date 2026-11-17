@@ -11,10 +11,14 @@ tags:
  - reachy_mini
  - reachy_mini_python_app
 ---
+# How to start Ari:
+Open the Reachy Mini app, then in Terminal:
 
+```bash
 cd /Users/arampundik/dev/aaram-v1
 source .venv/bin/activate
 reachy-mini-conversation-app --ui
+```
 
 
 
