@@ -599,6 +599,14 @@ class LocalStream:
             rpc.broadcast_threadsafe("conversation.turn", {"state": "listening", "reason": "interrupted"})
             return {"ok": True}
 
+        @rpc.method("conversation.new_participant")  # type: ignore[untyped-decorator]
+        async def _rpc_new_participant(_params: dict[str, object]) -> dict[str, object]:
+            # Playtest: fresh conversation context and a new recording folder.
+            # Only the voice session restarts; the daemon and the robot keep running.
+            self.clear_audio_queue()
+            await self.request_backend_restart("new_participant")
+            return {"ok": True}
+
         @rpc.method("conversation.mic")  # type: ignore[untyped-decorator]
         def _rpc_mic(params: dict[str, object]) -> dict[str, object]:
             if "muted" in params:

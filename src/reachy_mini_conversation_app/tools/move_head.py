@@ -32,8 +32,8 @@ class MoveHead(Tool):
     DELTAS: Dict[str, Tuple[int, int, int, int, int, int]] = {
         "left": (0, 0, 0, 0, 0, 40),
         "right": (0, 0, 0, 0, 0, -40),
-        "up": (0, 0, 0, 0, -30, 0),
-        "down": (0, 0, 0, 0, 30, 0),
+        "up": (0, 0, 0, 0, -15, 0),  # ARI new head: measured limit -22 deg, minus speech-sway margin
+        "down": (0, 0, 0, 0, 20, 0),  # ARI new head: measured limit +27.6 deg, minus speech-sway margin
         "front": (0, 0, 0, 0, 0, 0),
     }
 

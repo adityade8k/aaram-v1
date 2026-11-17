@@ -132,7 +132,9 @@ def wake_up_if_sleeping(robot: ReachyMini, logger: logging.Logger) -> bool:
     logger.info("Robot is in sleep pose; running wake-up movement.")
     try:
         robot.enable_motors()
-        robot.wake_up()
+        # ARI new head: the stock wake_up ends with a fast 20 deg roll, at the measured
+        # roll contact point of the new head. Go to neutral slowly instead.
+        robot.goto_target(np.eye(4), antennas=[-0.1745, 0.1745], duration=3.0)
     except Exception as e:
         logger.error("Failed to run wake-up movement: %s", e)
         return False
