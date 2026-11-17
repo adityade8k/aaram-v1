@@ -600,11 +600,12 @@ class LocalStream:
             return {"ok": True}
 
         @rpc.method("conversation.new_participant")  # type: ignore[untyped-decorator]
-        async def _rpc_new_participant(_params: dict[str, object]) -> dict[str, object]:
+        def _rpc_new_participant(_params: dict[str, object]) -> dict[str, object]:
             # Playtest: fresh conversation context and a new recording folder.
             # Only the voice session restarts; the daemon and the robot keep running.
+            # RPC runs on the web server's thread: hand the restart to the main loop.
             self.clear_audio_queue()
-            await self.request_backend_restart("new_participant")
+            self._mark_restart_requested("new_participant")
             return {"ok": True}
 
         @rpc.method("conversation.mic")  # type: ignore[untyped-decorator]
