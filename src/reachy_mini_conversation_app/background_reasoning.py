@@ -96,7 +96,39 @@ def _parse_advice(response: Message) -> ReasoningAdvice | None:
     start, end = text.find("{"), text.rfind("}")
     if start == -1 or end <= start:
         return None
-    return ReasoningAdvice.model_validate_json(text[start : end + 1])
+    try:
+        raw = json.loads(text[start : end + 1])
+    except json.JSONDecodeError:
+        return ReasoningAdvice.model_validate_json(text[start : end + 1])  # raises ValidationError
+    if not isinstance(raw, dict):
+        return None
+    # Clip over-long fields instead of discarding a good answer (seen live: a long snippet
+    # made the whole note fail validation and research then looked unavailable).
+    snippets = raw.get("snippets")
+    if isinstance(snippets, str):
+        snippets = [snippets]
+    if not isinstance(snippets, list):
+        snippets = []
+    clipped = [_clip_text(str(s), 600) for s in snippets if str(s).strip()][:2]
+    return ReasoningAdvice(
+        snippets=clipped,
+        next_question=_clip_text(str(raw.get("next_question") or ""), 300),
+        uncertainty=_clip_text(str(raw.get("uncertainty") or ""), 500),
+    )
+
+
+def _clip_text(text: str, limit: int) -> str:
+    """Shorten text to the limit, preferring a sentence or word boundary."""
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    cut = text[: limit - 1]
+    for mark in (". ", "; ", ", ", " "):
+        i = cut.rfind(mark)
+        if i > limit * 0.6:
+            cut = cut[: i + 1]
+            break
+    return cut.rstrip() + "…"
 
 
 class BackgroundReasoner:

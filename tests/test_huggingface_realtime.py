@@ -1097,6 +1097,50 @@ async def test_research_continuation_waits_for_playback_and_user_speech(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_research_continuation_survives_noise_that_never_becomes_a_turn(monkeypatch):
+    """A speech blip with no transcribed user turn delays, but does not cancel, the finding."""
+    monkeypatch.setattr(hf_mod, "_RESEARCH_QUIET_SECONDS", 0)
+    handler = _plain_handler()
+    handler._reasoner = SimpleNamespace(advice_id=1, user_turn=1)
+    handler.connection = MagicMock()
+    handler._response_done_event.set()
+    sent = []
+
+    async def fake_create(**kwargs):
+        sent.append(kwargs)
+
+    handler._safe_response_create = fake_create  # type: ignore[method-assign]
+    handler._user_speaking = True
+    handler._user_speech_serial = 1
+    task = asyncio.create_task(handler._resume_after_research(1, 1, 0))
+    await asyncio.sleep(0.15)
+    assert not sent
+    handler._user_speaking = False  # blip ended; user_turn unchanged (no transcript)
+    await asyncio.wait_for(task, 1)
+    assert sent and sent[0]["_research_speech"] == 1
+
+
+@pytest.mark.asyncio
+async def test_research_continuation_is_dropped_when_noise_was_a_real_turn(monkeypatch):
+    """If the detected speech became a transcribed user turn, the old finding is not spoken."""
+    monkeypatch.setattr(hf_mod, "_RESEARCH_QUIET_SECONDS", 0)
+    handler = _plain_handler()
+    reasoner = SimpleNamespace(advice_id=1, user_turn=1)
+    handler._reasoner = reasoner
+    handler.connection = MagicMock()
+    handler._response_done_event.set()
+    handler._safe_response_create = AsyncMock()  # type: ignore[method-assign]
+    handler._user_speaking = True
+    handler._user_speech_serial = 1
+    task = asyncio.create_task(handler._resume_after_research(1, 1, 0))
+    await asyncio.sleep(0.15)
+    reasoner.user_turn = 2
+    handler._user_speaking = False
+    await asyncio.wait_for(task, 1)
+    handler._safe_response_create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_queued_research_speech_is_dropped_if_student_starts_a_new_turn(monkeypatch):
     """The final sender rechecks input after a continuation has already been queued."""
     handler = _plain_handler()

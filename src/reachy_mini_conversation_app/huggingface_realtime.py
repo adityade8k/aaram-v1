@@ -67,7 +67,7 @@ logger = logging.getLogger(__name__)
 
 _RESPONSE_DONE_TIMEOUT: Final[float] = 30.0
 _RESPONSE_REJECTION_RETRY_DELAY: Final[float] = 0.5
-_RESEARCH_QUIET_SECONDS: Final[float] = 2.0
+_RESEARCH_QUIET_SECONDS: Final[float] = 1.5
 _RESEARCH_TOOL_NAMES = {
     "pollen_robotics_reachy_mini_search_tool__search_web",
     "pollen_robotics_reachy_mini_knowledge_tool__get_info",
@@ -407,19 +407,21 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     async def _resume_after_research(self, advice_id: int, user_turn: int, speech_serial: int) -> None:
         while self.connection is not None and self._reasoner is not None:
-            if (
-                self._reasoner.advice_id != advice_id
-                or self._reasoner.user_turn != user_turn
-                or self._user_speech_serial != speech_serial
-            ):
+            if self._reasoner.advice_id != advice_id or self._reasoner.user_turn != user_turn:
                 return
+            if self._user_speech_serial != speech_serial and not self._user_speaking:
+                # Detected speech that did not become a transcribed user turn (noise, echo).
+                # A real turn changes user_turn above; otherwise keep waiting for quiet.
+                speech_serial = self._user_speech_serial
             if (
                 not self._user_speaking
+                and self._user_speech_serial == speech_serial
                 and self._response_done_event.is_set()
                 and not self._in_flight_tool_calls
                 and self._pending_responses.empty()
                 and self.output_queue.empty()
-                and time.monotonic() >= max(self.playback_until, self.last_activity_time) + _RESEARCH_QUIET_SECONDS
+                and time.monotonic()
+                >= max(self.playback_until, self.last_conversation_activity_time) + _RESEARCH_QUIET_SECONDS
             ):
                 await self._safe_response_create(
                     _research_id=advice_id,

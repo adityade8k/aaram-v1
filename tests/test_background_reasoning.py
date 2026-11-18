@@ -288,7 +288,6 @@ async def test_close_cancels_research_and_publication():
         ("max_tokens", _advice(), None),
         ("refusal", _advice(), None),
         ("end_turn", None, "I could not produce JSON."),
-        ("end_turn", _advice("x" * 601), None),
     ],
 )
 @pytest.mark.asyncio
@@ -301,6 +300,22 @@ async def test_incomplete_refused_and_oversized_results_are_unavailable(stop_rea
         worker.request("Question")
         await _wait_status(worker, "unavailable")
         assert worker.advice_id == 0
+    finally:
+        await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_oversized_result_is_clipped_not_discarded():
+    """A long snippet is shortened to the limit so a good answer still reaches Ari."""
+    client = _client()
+    client.messages.create.return_value = _message(_advice("Processing was made by Fry and Reas. " * 40), "end_turn")
+    worker = BackgroundReasoner(client, "grounding", "model", AsyncMock(return_value=True), debounce_seconds=0)
+    try:
+        worker.request("Question")
+        await _wait_status(worker, "ready")
+        snippets = worker.research_status["snippets"]
+        assert snippets and all(len(s) <= 600 for s in snippets)
+        assert snippets[0].startswith("Processing was made by Fry and Reas.")
     finally:
         await worker.close()
 

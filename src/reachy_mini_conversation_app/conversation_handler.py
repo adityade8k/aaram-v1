@@ -33,6 +33,7 @@ class ConversationHandler(AsyncStreamHandler, ABC):
     tool_manager: BackgroundToolManager
     output_queue: asyncio.Queue[QueueItem]
     playback_until: float = 0.0
+    last_conversation_activity_time: float = 0.0
     last_activity_time: float
     last_idle_behavior_time: float
     _activity_observer: Callable[[str], None] | None = None
@@ -69,6 +70,10 @@ class ConversationHandler(AsyncStreamHandler, ABC):
     def _mark_activity(self, reason: str) -> None:
         """Record non-idle conversation activity for the idle timer."""
         self.last_activity_time = time.monotonic()
+        if reason != "research_updated":
+            # Audible or turn-taking activity only: an advisor result arriving is not a reason
+            # to restart the quiet window before Ari may speak that result.
+            self.last_conversation_activity_time = self.last_activity_time
         logger.debug("last activity time updated to %s (%s)", self.last_activity_time, reason)
         if self._activity_observer is not None:
             try:
