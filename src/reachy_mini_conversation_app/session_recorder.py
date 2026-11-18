@@ -16,6 +16,8 @@ from numpy.typing import NDArray
 
 from reachy_mini_conversation_app.memory import memory_path_for_instance
 
+LABEL_ENV = "REACHY_MINI_SESSION_LABEL"
+
 
 logger = logging.getLogger(__name__)
 
@@ -80,8 +82,14 @@ class SessionRecorder:
         frame_source: Callable[[], bytes | None] | None = None,
         camera_fps: float = DEFAULT_CAMERA_FPS,
         use_ffmpeg: bool | None = None,
+        condition: dict[str, object] | None = None,
     ) -> None:
-        """Create the session folder and start capturing."""
+        """Create the session folder and start capturing.
+
+        ``condition`` describes the experimental setup (advisor on/off, model, profile) and is
+        written to ``meta.json`` and the transcript header. ``REACHY_MINI_SESSION_LABEL`` adds a
+        free-text label (for example ``Q1-5 advisor-off``).
+        """
         self.started_ms = time.time_ns() // 1_000_000
         stamp = datetime.fromtimestamp(self.started_ms / 1000).strftime("%Y%m%d-%H%M%S")
         override = (os.getenv(RECORDING_DIR_ENV) or "").strip()
@@ -89,6 +97,10 @@ class SessionRecorder:
         self.directory = base / f"{stamp}_{session_id[:8]}"
         self.directory.mkdir(parents=True, exist_ok=True)
         self._session_id = session_id
+        self._condition = dict(condition or {})
+        label = (os.getenv(LABEL_ENV) or "").strip()
+        if label:
+            self._condition["label"] = label
         self._t0 = time.time()
         self._writer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="session-recorder")
         self._mic = _WavTrack(self.directory / "mic.wav", self._t0)
@@ -117,6 +129,7 @@ class SessionRecorder:
             "v": 1,
             "session_id": self._session_id,
             "started_ms": self.started_ms,
+            "condition": self._condition,
             "camera_fps": round(1.0 / self._interval, 3) if self._frame_source else None,
             "frames": self._frames,
             "ended": ended,
@@ -184,8 +197,12 @@ class SessionRecorder:
             self._transcript = (self.directory / "transcript.txt").open("w", encoding="utf-8")
             started = datetime.fromtimestamp(self.started_ms / 1000).strftime("%Y-%m-%d %H:%M:%S")
             self._transcript.write(
-                f"Session started {started}. Times are mm:ss from start, taken when each line was completed.\n\n"
+                f"Session started {started}. Times are mm:ss from start, taken when each line was completed.\n"
             )
+            if self._condition:
+                summary = ", ".join(f"{k}={v}" for k, v in self._condition.items())
+                self._transcript.write(f"Condition: {summary}\n")
+            self._transcript.write("\n")
         seconds = max(0.0, (t_ms - self.started_ms) / 1000)
         stamp = f"[{int(seconds // 60):02d}:{seconds % 60:04.1f}]"
         body = text.replace("\n", "\n" + " " * (len(stamp) + 1))

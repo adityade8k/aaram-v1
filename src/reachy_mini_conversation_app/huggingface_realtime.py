@@ -196,6 +196,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 self.experiment_log.session_id,
                 frame_source=frame_source,
                 camera_fps=config.SESSION_RECORDING_FPS,
+                condition={
+                    "advisor": "on" if config.REASONING_ENABLED else "off",
+                    "advisor_model": config.REASONING_MODEL if config.REASONING_ENABLED else None,
+                    "advisor_web_search": config.REASONING_WEB_SEARCH if config.REASONING_ENABLED else None,
+                    "profile": config.REACHY_MINI_CUSTOM_PROFILE,
+                },
             )
             self.experiment_log.listener = self._recorder.log_event
             self.experiment_log.record(

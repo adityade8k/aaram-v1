@@ -121,3 +121,16 @@ def test_transcript_shows_when_and_why_reasoner_was_used(tmp_path):
     assert "REASONER: #1 asked (user turn 2, web search required): kerf on 3mm acrylic" in text
     assert "REASONER: #1 answered in 4.2s (1 web searches, end_turn): Kerf is ~0.2mm" in text
     assert "[00:07.0] REASONER: #1 advice was available" in text
+
+
+def test_records_experimental_condition(tmp_path, monkeypatch):
+    """The advisor condition and an optional label land in meta.json and the transcript header."""
+    monkeypatch.setenv("REACHY_MINI_SESSION_LABEL", "Q1-5 advisor-off")
+    recorder = SessionRecorder(tmp_path, "abcdef1234567890", condition={"advisor": "off", "profile": "ari"})
+    recorder.log_event("input", {"role": "user", "text": "hi"}, recorder.started_ms + 1000)
+    recorder.close()
+    meta = json.loads((recorder.directory / "meta.json").read_text())
+    assert meta["condition"] == {"advisor": "off", "profile": "ari", "label": "Q1-5 advisor-off"}
+    lines = (recorder.directory / "transcript.txt").read_text().splitlines()
+    assert lines[1] == "Condition: advisor=off, profile=ari, label=Q1-5 advisor-off"
+    assert "[00:01.0] USER: hi" in lines
