@@ -486,3 +486,58 @@ async def test_disabled_setup_is_recorded_for_later_diagnosis(tmp_path, monkeypa
     row = json.loads(gzip.decompress(archive.path.read_bytes()))
     assert row["e"] == "research_setup" and row["enabled"] is False
     assert "ANTHROPIC_API_KEY" in row["reason"]
+
+
+
+def test_backchannels_are_not_delivery_turns():
+    """Short listening sounds and one-word answers do not block a ready finding."""
+    from reachy_mini_conversation_app.background_reasoning import _is_backchannel
+
+    for text in ["Hmm.", "No.", "Yes.", "OK", "uh huh", "Thank you.", "Right."]:
+        assert _is_backchannel(text), text
+    for text in ["The person.", "What is the project?", "No, the other one", "Are you sure?"]:
+        assert not _is_backchannel(text), text
+
+
+@pytest.mark.asyncio
+async def test_correction_survives_backchannels_and_new_questions():
+    """test02 Q3: the advisor's retraction outlives "Hmm." and a new research request until spoken."""
+    client = _client()
+    raw = '{"snippets": ["No such work exists."], "next_question": "", "uncertainty": "", '
+    raw += '"correction": "Ari invented that winner; the real 2026 winner is unknown to Ari."}'
+    client.messages.create.return_value = _message(text=raw)
+    worker = BackgroundReasoner(client, "grounding", "model", AsyncMock(return_value=True), debounce_seconds=0)
+    try:
+        worker.observe("user", "What is the project?")
+        worker.request("What is the project Screaming?")
+        await _wait_status(worker, "ready")
+        assert worker.correction_id == 1
+        before = worker.delivery_turn
+        worker.observe("user", "Hmm.")
+        assert worker.delivery_turn == before
+        worker.observe("user", "Is there research on robot shapes?")
+        worker.request("Robot shape research")
+        assert worker.correction_id == 1
+        assert "CORRECTION REQUIRED" in worker.conversation_context
+        worker.consume_correction(1)
+        assert worker.correction_id == 0
+        assert "CORRECTION REQUIRED" not in worker.conversation_context
+    finally:
+        await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_pending_question_is_marked_unanswered_and_advisor_gets_date_and_words():
+    """While research runs, Ari is told not to answer; the advisor sees today's date and the exact words."""
+    client = _client()
+    worker = BackgroundReasoner(client, "grounding", "model", AsyncMock(return_value=True), debounce_seconds=0)
+    try:
+        worker.observe("user", "Ari, who won the Golden Nica this year?")
+        worker.request("Who won the Golden Nica in 2024 or 2025?")
+        assert "PENDING research question" in worker.conversation_context
+        await _wait_status(worker, "ready")
+        prompt = client.messages.create.call_args.kwargs["messages"][0]["content"]
+        assert "TODAY'S DATE:" in prompt
+        assert "Ari, who won the Golden Nica this year?" in prompt
+    finally:
+        await worker.close()

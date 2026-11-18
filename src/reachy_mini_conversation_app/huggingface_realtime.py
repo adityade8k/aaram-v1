@@ -149,6 +149,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._research_followup_task: asyncio.Task[None] | None = None
         self._published_advice_id = 0
         self._response_advice_id = 0
+        self._published_correction_id = 0
+        self._response_correction_id = 0
+        self._correction_followup_task: asyncio.Task[None] | None = None
+        self._correction_followup_id = 0
         self._response_had_audio = False
         self._response_interrupted = False
         self._user_speaking = False
@@ -381,6 +385,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 ),
             )
             self._published_advice_id = advice_id
+            self._published_correction_id = self._reasoner.correction_id if self._reasoner is not None else 0
             logger.info("Refreshed session instructions: research_id=%d", advice_id)
             return True
 
@@ -396,18 +401,48 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             sent
             and reasoner is not None
             and reasoner.advice_id
-            and reasoner.advice_user_turn == reasoner.user_turn
+            and reasoner.advice_delivery_turn == reasoner.delivery_turn
             and reasoner.research_status["snippets"]
         ):
             self._research_followup_task = asyncio.create_task(
-                self._resume_after_research(reasoner.advice_id, reasoner.user_turn, self._user_speech_serial),
+                self._resume_after_research(reasoner.advice_id, reasoner.delivery_turn, self._user_speech_serial),
                 name="research-followup",
+            )
+        correction_id = reasoner.correction_id if reasoner is not None else 0
+        if sent and correction_id and correction_id != self._correction_followup_id:
+            if self._correction_followup_task is not None:
+                self._correction_followup_task.cancel()
+            self._correction_followup_id = correction_id
+            self._correction_followup_task = asyncio.create_task(
+                self._resume_for_correction(correction_id), name="correction-followup"
             )
         return sent
 
+    async def _resume_for_correction(self, correction_id: int) -> None:
+        """Speak a correction at the next quiet moment, even after short replies like "hmm".
+
+        If the student starts a real turn first, the correction is still in the instructions and
+        is said at the start of that reply; this task then ends because it has been consumed.
+        """
+        while self.connection is not None and self._reasoner is not None:
+            if self._reasoner.correction_id != correction_id:
+                return
+            if (
+                not self._user_speaking
+                and self._response_done_event.is_set()
+                and not self._in_flight_tool_calls
+                and self._pending_responses.empty()
+                and self.output_queue.empty()
+                and time.monotonic()
+                >= max(self.playback_until, self.last_conversation_activity_time) + _RESEARCH_QUIET_SECONDS
+            ):
+                await self._safe_response_create(_correction_id=correction_id)
+                return
+            await asyncio.sleep(0.1)
+
     async def _resume_after_research(self, advice_id: int, user_turn: int, speech_serial: int) -> None:
         while self.connection is not None and self._reasoner is not None:
-            if self._reasoner.advice_id != advice_id or self._reasoner.user_turn != user_turn:
+            if self._reasoner.advice_id != advice_id or self._reasoner.delivery_turn != user_turn:
                 return
             if self._user_speech_serial != speech_serial and not self._user_speaking:
                 # Detected speech that did not become a transcribed user turn (noise, echo).
@@ -658,6 +693,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             research_id = kwargs.pop("_research_id", 0)
             research_turn = kwargs.pop("_research_turn", 0)
             research_speech = kwargs.pop("_research_speech", 0)
+            correction_id = kwargs.pop("_correction_id", 0)
             sent = False
             max_retries = 5
             attempts = 0
@@ -678,7 +714,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     if (
                         self._reasoner is None
                         or self._reasoner.advice_id != research_id
-                        or self._reasoner.user_turn != research_turn
+                        or self._reasoner.delivery_turn != research_turn
                         or self._user_speech_serial != research_speech
                         or self._user_speaking
                     ):
@@ -692,6 +728,22 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         }
                     }
                     logger.info("Research continuation queued for speech: research_id=%d", research_id)
+                elif correction_id:
+                    if (
+                        self._reasoner is None
+                        or self._reasoner.correction_id != correction_id
+                        or self._user_speaking
+                    ):
+                        break
+                    kwargs = {
+                        "response": {
+                            "instructions": self._get_live_instructions()
+                            + "\nSay the correction now, in one or two sentences, starting with \"Correction:\". "
+                            "State the right fact or that it is unknown. Do not add anything else.",
+                            "tool_choice": "none",
+                        }
+                    }
+                    logger.info("Correction queued for speech: research_id=%d", correction_id)
                 self._last_response_rejected = False
                 self._response_started_or_rejected_event.clear()
                 try:
@@ -971,6 +1023,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     if event.type == "response.created":
                         self._mark_activity("response_created")
                         self._response_advice_id = self._published_advice_id
+                        self._response_correction_id = self._published_correction_id
                         self._response_had_audio = False
                         self._response_interrupted = False
                         self.experiment_log.record("response_started", {"research_id": self._response_advice_id})
@@ -1006,6 +1059,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             and event.response.status == "completed"
                         ):
                             self._reasoner.consume(self._response_advice_id)
+                            self._reasoner.consume_correction(self._response_correction_id)
                         logger.debug("Response done")
 
                     if event.type == "conversation.item.input_audio_transcription.delta":
@@ -1180,7 +1234,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     self._research_followup_task.cancel()
                     await asyncio.gather(self._research_followup_task, return_exceptions=True)
                     self._research_followup_task = None
+                if self._correction_followup_task is not None:
+                    self._correction_followup_task.cancel()
+                    await asyncio.gather(self._correction_followup_task, return_exceptions=True)
+                    self._correction_followup_task = None
+                self._correction_followup_id = 0
                 self._published_advice_id = 0
+                self._published_correction_id = 0
                 if self._reasoner is not None:
                     await self._reasoner.close()
                     self._reasoner = None
@@ -1251,7 +1311,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._research_followup_task.cancel()
             await asyncio.gather(self._research_followup_task, return_exceptions=True)
             self._research_followup_task = None
+        if self._correction_followup_task is not None:
+            self._correction_followup_task.cancel()
+            await asyncio.gather(self._correction_followup_task, return_exceptions=True)
+            self._correction_followup_task = None
+        self._correction_followup_id = 0
         self._published_advice_id = 0
+        self._published_correction_id = 0
         if self._reasoner is not None:
             await self._reasoner.close()
             self._reasoner = None

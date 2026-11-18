@@ -1101,7 +1101,7 @@ async def test_research_continuation_survives_noise_that_never_becomes_a_turn(mo
     """A speech blip with no transcribed user turn delays, but does not cancel, the finding."""
     monkeypatch.setattr(hf_mod, "_RESEARCH_QUIET_SECONDS", 0)
     handler = _plain_handler()
-    handler._reasoner = SimpleNamespace(advice_id=1, user_turn=1)
+    handler._reasoner = SimpleNamespace(advice_id=1, user_turn=1, delivery_turn=1, correction_id=0)
     handler.connection = MagicMock()
     handler._response_done_event.set()
     sent = []
@@ -1125,7 +1125,7 @@ async def test_research_continuation_is_dropped_when_noise_was_a_real_turn(monke
     """If the detected speech became a transcribed user turn, the old finding is not spoken."""
     monkeypatch.setattr(hf_mod, "_RESEARCH_QUIET_SECONDS", 0)
     handler = _plain_handler()
-    reasoner = SimpleNamespace(advice_id=1, user_turn=1)
+    reasoner = SimpleNamespace(advice_id=1, user_turn=1, delivery_turn=1, correction_id=0)
     handler._reasoner = reasoner
     handler.connection = MagicMock()
     handler._response_done_event.set()
@@ -1135,6 +1135,7 @@ async def test_research_continuation_is_dropped_when_noise_was_a_real_turn(monke
     task = asyncio.create_task(handler._resume_after_research(1, 1, 0))
     await asyncio.sleep(0.15)
     reasoner.user_turn = 2
+    reasoner.delivery_turn = 2
     handler._user_speaking = False
     await asyncio.wait_for(task, 1)
     handler._safe_response_create.assert_not_awaited()
@@ -1144,7 +1145,7 @@ async def test_research_continuation_is_dropped_when_noise_was_a_real_turn(monke
 async def test_queued_research_speech_is_dropped_if_student_starts_a_new_turn(monkeypatch):
     """The final sender rechecks input after a continuation has already been queued."""
     handler = _plain_handler()
-    handler._reasoner = SimpleNamespace(advice_id=1, user_turn=1)
+    handler._reasoner = SimpleNamespace(advice_id=1, user_turn=1, delivery_turn=1, correction_id=0)
     handler.connection = MagicMock()
     handler.connection.response.create = AsyncMock()
     handler._response_done_event.clear()
@@ -1328,3 +1329,34 @@ async def test_real_tool_handoff_returns_and_speaks_before_research_finishes(
     assert events_saved.index("tool_result") < events_saved.index("research_response")
     assert events_saved.index("response", events_saved.index("tool_result")) < events_saved.index("research_response")
     assert "research_exposed" in events_saved
+
+
+@pytest.mark.asyncio
+async def test_correction_is_spoken_after_a_backchannel(monkeypatch):
+    """test02 Q3: a correction must still be volunteered after the student says "Hmm."."""
+    monkeypatch.setattr(hf_mod, "_RESEARCH_QUIET_SECONDS", 0)
+    handler = _plain_handler()
+    reasoner = SimpleNamespace(advice_id=0, user_turn=9, delivery_turn=8, correction_id=5)
+    handler._reasoner = reasoner
+    handler.connection = MagicMock()
+    handler._response_done_event.set()
+    handler._safe_response_create = AsyncMock()  # type: ignore[method-assign]
+    await asyncio.wait_for(handler._resume_for_correction(5), 1)
+    handler._safe_response_create.assert_awaited_once_with(_correction_id=5)
+
+
+@pytest.mark.asyncio
+async def test_correction_followup_stops_once_consumed(monkeypatch):
+    """If a reply already carried the correction, the proactive follow-up does not repeat it."""
+    monkeypatch.setattr(hf_mod, "_RESEARCH_QUIET_SECONDS", 0)
+    handler = _plain_handler()
+    reasoner = SimpleNamespace(advice_id=0, user_turn=1, delivery_turn=1, correction_id=5)
+    handler._reasoner = reasoner
+    handler.connection = MagicMock()
+    handler._user_speaking = True
+    handler._safe_response_create = AsyncMock()  # type: ignore[method-assign]
+    task = asyncio.create_task(handler._resume_for_correction(5))
+    await asyncio.sleep(0.15)
+    reasoner.correction_id = 0
+    await asyncio.wait_for(task, 1)
+    handler._safe_response_create.assert_not_awaited()

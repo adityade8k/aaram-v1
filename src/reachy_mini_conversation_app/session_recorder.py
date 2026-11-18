@@ -170,6 +170,9 @@ class SessionRecorder:
             advice = fields.get("advice")
             notes = advice.get("snippets") if isinstance(advice, dict) else None
             summary = " | ".join(str(n) for n in notes) if notes else "no usable advice"
+            correction = advice.get("correction") if isinstance(advice, dict) else None
+            if correction:
+                summary += f" || CORRECTION: {correction}"
             seconds = float(fields.get("elapsed_ms") or 0) / 1000  # type: ignore[arg-type]
             flags = ", stale and discarded" if fields.get("stale") else ""
             speaker = "REASONER"
@@ -181,6 +184,8 @@ class SessionRecorder:
             speaker, text = "REASONER", f"#{fields.get('research_id')} sources: {_clip(fields.get('sources'), 400)}"
         elif event == "research_exposed":
             speaker, text = "REASONER", f"#{fields.get('research_id')} advice was available to Ari's spoken reply"
+        elif event == "correction_exposed":
+            speaker, text = "REASONER", f"#{fields.get('research_id')} correction was available to Ari's spoken reply"
         elif event == "research_cancelled":
             speaker, text = "REASONER", f"#{fields.get('research_id')} cancelled"
         elif event == "research_failed":

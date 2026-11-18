@@ -16,8 +16,10 @@ class ResearchQuestion(Tool):
         "History, science, art, current events, and project context are welcome. "
         "The advisor can research the web. This tool returns immediately, not the answer. "
         "Set search_web=true when the user requests a lookup, current information, or sources. "
-        "Then continue naturally with a known fact or ONE useful topic-specific clarification. "
-        "Include the actual question and relevant context; do not redirect unrelated topics to laser cutting. "
+        "Then acknowledge briefly; do NOT state the answer (names, titles, dates, numbers) until the research "
+        "note arrives. General background you are certain of, or ONE useful clarification, is fine. "
+        "Write the question in the student's own words; never add, guess, or change years or dates "
+        "(keep 'this year' as said). Do not redirect unrelated topics to laser cutting. "
         "Call again only for a new question or information that changes the research; never poll this tool."
     )
     parameters_schema = {
