@@ -65,8 +65,11 @@ def test_profile_listing_requires_profile_document(tmp_path: Path) -> None:
 
 
 def test_bundled_profiles_enable_head_tracking_by_default() -> None:
-    """Every bundled personality should start with head tracking available."""
+    """Bundled personalities start with head tracking, except Ari, whose new head is limits-restricted."""
     for profile_name in list_profile_names(DEFAULT_PROFILES_DIRECTORY):
         profile = read_profile_from_directory(profile_name, DEFAULT_PROFILES_DIRECTORY / profile_name)
 
-        assert "head_tracking" in profile.default_tools, profile_name
+        if profile_name == "ari":
+            assert "head_tracking" not in profile.default_tools, profile_name
+        else:
+            assert "head_tracking" in profile.default_tools, profile_name

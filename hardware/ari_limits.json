@@ -1,0 +1,84 @@
+{
+  "axes": {
+    "x": [
+      -4,
+      4
+    ],
+    "y": [
+      -4,
+      4
+    ],
+    "z": [
+      -31.28,
+      6
+    ],
+    "roll": [
+      -18.4,
+      18.4
+    ],
+    "pitch": [
+      -22.08,
+      27.6
+    ],
+    "yaw": [
+      -46.0,
+      50.6
+    ],
+    "ant_r": [
+      -30,
+      175
+    ],
+    "ant_l": [
+      -175,
+      30
+    ],
+    "body": [
+      -30,
+      30
+    ]
+  },
+  "combos": [
+    {
+      "name": "pitch_down+roll",
+      "terms": [
+        "pitch+",
+        "roll"
+      ],
+      "limit": 0.99,
+      "measured": [
+        0.99
+      ]
+    },
+    {
+      "name": "pitch_up+roll",
+      "terms": [
+        "pitch-",
+        "roll"
+      ],
+      "limit": 1.0
+    },
+    {
+      "name": "pitch_down+z_down",
+      "terms": [
+        "pitch+",
+        "z-"
+      ],
+      "limit": 1.0
+    },
+    {
+      "name": "roll+z_down",
+      "terms": [
+        "roll",
+        "z-"
+      ],
+      "limit": 1.0
+    }
+  ],
+  "max_speed": {
+    "rot_deg_s": 90.0,
+    "pos_mm_s": 60.0,
+    "ant_deg_s": 300.0,
+    "body_deg_s": 45.0
+  },
+  "calibrated": true
+}

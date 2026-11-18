@@ -4,7 +4,7 @@
  * Robot stays live, tapping the orb only mutes or unmutes the user's mic.
  */
 
-import { applyPersonality, experimentLog, getMicState, getResearchStatus, listPersonalities, setMicMuted, subscribe } from "../api.js";
+import { applyPersonality, experimentLog, getMicState, getResearchStatus, listPersonalities, newParticipant, setMicMuted, subscribe } from "../api.js";
 import { ORB_STATES } from "../constants.js";
 import { createOrb, mapActivityToState } from "../orb.js";
 import { consumePendingApply } from "../pending-apply.js";
@@ -38,6 +38,7 @@ export async function mountTalkView({ outlet, signal }) {
   const logStatus = h("p", { class: "talk__log-status", role: "status", "aria-live": "polite" }, "Checking recording…");
   const downloadLog = h("button", { class: "btn btn--ghost", type: "button", onclick: onDownloadLog }, "Download data");
   const clearLog = h("button", { class: "btn btn--ghost", type: "button", onclick: onClearLog }, "Clear data…");
+  const newParticipantBtn = h("button", { class: "btn", type: "button", onclick: onNewParticipant }, "New participant");
   let logBusy = false;
 
   const caption = h(
@@ -70,7 +71,7 @@ export async function mountTalkView({ outlet, signal }) {
     references,
     h("div", { class: "talk__log", "aria-label": "Experiment recording" },
       logStatus,
-      h("div", { class: "talk__log-actions" }, downloadLog, clearLog)
+      h("div", { class: "talk__log-actions" }, newParticipantBtn, downloadLog, clearLog)
     )
   );
   outlet.replaceChildren(view);
@@ -243,6 +244,18 @@ export async function mountTalkView({ outlet, signal }) {
 
   function restingState() {
     return muted ? ORB_STATES.MUTED : ORB_STATES.IDLE;
+  }
+
+  async function onNewParticipant() {
+    newParticipantBtn.disabled = true;
+    caption.textContent = "Starting a new session…";
+    try {
+      await newParticipant();
+    } catch (error) {
+      if (!signal.aborted) caption.textContent = `New participant failed: ${error?.message || error}`;
+    } finally {
+      setTimeout(() => { newParticipantBtn.disabled = false; }, 3000);
+    }
   }
 
   async function onMicTap() {

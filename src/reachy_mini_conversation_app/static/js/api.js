@@ -138,6 +138,7 @@ export const deletePersonality = (name) => rpcCall("personalities.delete", { nam
 
 export const getMicState = () => rpcCall("conversation.mic", {});
 export const setMicMuted = (muted) => rpcCall("conversation.mic", { muted });
+export const newParticipant = () => rpcCall("conversation.new_participant", {});
 
 export const listVoices = () => rpcCall("voices.list");
 export const getCurrentVoice = () => rpcCall("voices.current");
