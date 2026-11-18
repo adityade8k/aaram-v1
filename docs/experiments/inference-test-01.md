@@ -9,7 +9,11 @@ Date: 2026-11-17 · Branch: `inferencetesting` · App: aaram-v1 (main conversati
 | OFF | `REACHY_MINI_REASONING_ENABLED=false` | HF voice model alone, plus its bundled lookup tools (`search_web`, `get_info`, `search_docs`) if those tool spaces are enabled |
 | ON | `REACHY_MINI_REASONING_ENABLED=true` | Voice model hands questions to the Claude advisor (`claude-sonnet-5-5`, web search on) via `research_question`; the bundled lookup tools are removed |
 
-Caveat: OFF is not "no web access." If the voice model calls `search_web` in OFF, the transcript shows it as a `TOOL:` line. This test compares two architectures, not "knowledge vs no knowledge."
+OFF keeps Pollen's `search_web` on purpose. Both conditions can look things up; the difference is how. In OFF the voice model does the lookup inside its own turn. In ON it hands it to the advisor and stays free to talk.
+
+**Hypothesis:** background inference makes the conversation smoother, meaning less dead air, earlier useful speech, and the ability to keep talking while a lookup runs, without the result derailing the conversation when it lands.
+
+The test has to be able to show this is false. If OFF turns out just as smooth (for example, Pollen's search returns fast enough), that is a valid result, not a failed test. Accuracy is still logged: smooth but wrong is not a win.
 
 ## Recording (already automatic)
 
@@ -27,7 +31,9 @@ Keep `REACHY_MINI_MEMORY_ENABLED=false` (it is now), so nothing from the OFF run
 
 1. Run OFF first: set `REACHY_MINI_REASONING_ENABLED=false`, `REACHY_MINI_SESSION_LABEL="test01 OFF"`. Restart the app (env is read at startup).
 2. Ask Q1–Q5 verbatim, in order, in one session. Ask the listed follow-ups.
-3. Timing rule, applied in both conditions: after Ari's first answer to a main question, stay silent for 30 s before the first follow-up. In ON mode the advisor needs up to ~45 s and only speaks after a 2 s quiet window, so jumping in early hides what it would have added. The same wait in OFF keeps the conditions fair.
+3. Timing rule, the same in both conditions. Smoothness only shows up if you behave like a real user, so run each main question in two beats:
+   - **Beat A, talk during the lookup:** ask the main question. As soon as Ari's first reply ends (or 5 s after your question if Ari is silent), ask follow-up (a). This tests whether Ari can hold a conversation while a lookup is pending.
+   - **Beat B, let it land:** then stay quiet for 30 s. This tests whether a late result comes back naturally or interrupts, repeats or derails. Then ask follow-up (b).
 4. Do not improvise follow-ups for the scored run. If Ari says something worth chasing, note it and chase it after Q5.
 5. End the session. Switch to ON (`=true`, label `"test01 ON"`), restart, repeat 2–4 identically.
 6. Fill in the comparison table below from the two transcripts, not from memory.
@@ -71,23 +77,35 @@ Each targets a different failure mode, so the comparison says something beyond "
 - Follow-ups: (a) if Ari corrects you: "What's his most recent show?" (b) if Ari accepts the premise: "Are you sure?"
 - Tests: sycophancy. Accepting the premise and making up a reason is a serious failure. The advisor may catch it, but only if the voice model hands the question off.
 
-## What to log per question (fill in from transcripts)
+## What to log per question (fill in from transcripts and audio)
+
+Primary metrics, smoothness:
 
 | | OFF | ON |
 | --- | --- | --- |
-| First speech latency (USER line → first ARI line) | | |
-| Substantive answer latency (to the line containing the key fact) | | |
-| Tool used? (`TOOL:` / `REASONER:` lines, web searches count) | | |
+| First speech latency (end of your question → Ari starts speaking) | | |
+| Longest dead air after your question (silence while a lookup is pending) | | |
+| Time to substantive answer (the line that contains the key fact) | | |
+| Beat A: did Ari answer follow-up (a) relevantly while the lookup was pending? | | |
+| Beat B: did the late result come back naturally, or interrupt / repeat / jump topic? | | |
+| Filler: empty "let me check" lines, repeated waiting announcements | | |
+| Talk-over: Ari speaking over you, or getting cut off (`ARI (interrupted)`) | | |
+| Your overall felt smoothness (1–5), written right after each question | | |
+
+Secondary, a sanity check that smoothness didn't come at the cost of quality:
+
+| | OFF | ON |
+| --- | --- | --- |
 | Accuracy: correct / partial / wrong / fabricated | | |
-| Uncertainty: admitted when it should? overclaimed? | | |
-| Follow-up coherence (remembers context, no contradictions) | | |
-| Turn-taking: talked over you, late interjection, dead air | | |
+| Lookup path: `TOOL: search_web` vs `REASONER:` lines | | |
 | Character: stayed Ari (concise, Socratic where appropriate) | | |
-| Notes / quote | | |
+
+Latency and dead air need the audio: transcript times are when a line finished, not when speech started. Measure them from `mic.wav` and `assistant.wav`, which share the session clock.
 
 ## Reading the result honestly
 
 - With one run per condition, every difference could be noise. Voice-model answers vary run to run. If a difference matters for a design decision, repeat that question 2–3 times per condition before trusting it.
 - Speech recognition errors land in both conditions. Check the USER line before blaming the model.
 - "Advice was available to Ari's spoken reply" (`research_exposed`) means the note was sent, not that Ari used it. Compare the REASONER note text to what ARI actually said.
-- Latency in the transcript is time of line completion, not physical speaker onset. Use `assistant.wav` if exact onset matters.
+- Q1 probably won't trigger a lookup in either condition. It is the control: if ON is less smooth there, the advisor is adding cost on questions that don't need it.
+- You are the asker and you want ON to win, so your 1–5 ratings are the weakest evidence here. The audio-derived timings and the Beat A / Beat B outcomes are what to lead with. For the HRI paper, a blind rater (someone who hears the two recordings without knowing which is which) would make the felt-smoothness claim much stronger.
