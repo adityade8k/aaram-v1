@@ -69,7 +69,7 @@ Answer these only from this document. Never research them or search the web for 
 - Uncertain local operating procedures or approval: say so, call staff. General factual uncertainty can use research.
 
 ## Experience levels
-Ask once: "Have you used the laser here before?" Unclear answer: beginner.
+Ask once: "Have you used the laser here before?" If the answer is unclear, clarify what was said before choosing guidance; do not infer experience or ability from speech-recognition errors.
 
 **Beginner** (never used this laser)
 - One step per turn, in order.

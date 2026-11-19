@@ -1,3 +1,4 @@
+import os
 import json
 import time
 import uuid
@@ -6,6 +7,9 @@ import random
 import asyncio
 import logging
 from typing import TYPE_CHECKING, Any, Final, Tuple, Optional
+from hashlib import sha256
+from pathlib import Path
+from importlib.metadata import PackageNotFoundError, version
 
 import httpx
 import numpy as np
@@ -28,7 +32,9 @@ from openai.types.realtime.realtime_audio_input_turn_detection_param import Serv
 
 from reachy_mini_conversation_app.tools import core_tools
 from reachy_mini_conversation_app.config import (
+    PROJECT_ROOT,
     HF_LOCAL_CONNECTION_MODE,
+    DEFAULT_PROFILES_DIRECTORY,
     config,
     get_default_voice,
     set_custom_profile,
@@ -43,7 +49,14 @@ from reachy_mini_conversation_app.prompts import (
     get_session_greeting_prompt,
 )
 from reachy_mini_conversation_app.streaming import AdditionalOutputs, audio_to_int16
-from reachy_mini_conversation_app.session_recorder import SessionRecorder
+from reachy_mini_conversation_app.profile_store import (
+    PROFILE_FILENAME,
+    DEFAULT_PROFILE_NAME,
+    ProfileFormatError,
+    read_profile,
+    read_packaged_default_profile,
+)
+from reachy_mini_conversation_app.session_recorder import LABEL_ENV, SessionRecorder
 from reachy_mini_conversation_app.tools.core_tools import (
     ToolSpec,
     ToolDependencies,
@@ -67,7 +80,7 @@ logger = logging.getLogger(__name__)
 
 _RESPONSE_DONE_TIMEOUT: Final[float] = 30.0
 _RESPONSE_REJECTION_RETRY_DELAY: Final[float] = 0.5
-_RESEARCH_QUIET_SECONDS: Final[float] = 1.5
+_RESEARCH_QUIET_SECONDS: Final[float] = 0.75
 _RESEARCH_TOOL_NAMES = {
     "pollen_robotics_reachy_mini_search_tool__search_web",
     "pollen_robotics_reachy_mini_knowledge_tool__get_info",
@@ -147,9 +160,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._reasoner: BackgroundReasoner | None = None
         self._instruction_lock = asyncio.Lock()
         self._research_followup_task: asyncio.Task[None] | None = None
-        self._published_advice_id = 0
-        self._response_advice_id = 0
+        self._research_followup_id = 0
+        self._published_research_id = 0
+        self._response_research_id = 0
         self._published_correction_id = 0
+        self._instructions_sha256 = ""
         self._response_correction_id = 0
         self._correction_followup_task: asyncio.Task[None] | None = None
         self._correction_followup_id = 0
@@ -183,12 +198,16 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._turn_user_done_at: float | None = None
         self._turn_response_created_at: float | None = None
         self._turn_first_audio_at: float | None = None
+        self._turn_id = 0
+        self._audio_input_turn_ids: dict[str, int] = {}
+        self._response_turn_id: int | None = None
+        self._turn_input_mode = "audio"
         self._startup_greeting_sent = False
         self._in_flight_tool_calls: set[str] = set()
         self._tool_batch_needs_response = False
         self._recorder: SessionRecorder | None = None
 
-    def _start_session_recording(self) -> None:
+    def _start_session_recording(self, condition: dict[str, object]) -> None:
         """Begin speech + camera capture when enabled; failures never block the conversation."""
         if not config.SESSION_RECORDING:
             return
@@ -200,12 +219,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 self.experiment_log.session_id,
                 frame_source=frame_source,
                 camera_fps=config.SESSION_RECORDING_FPS,
-                condition={
-                    "advisor": "on" if config.REASONING_ENABLED else "off",
-                    "advisor_model": config.REASONING_MODEL if config.REASONING_ENABLED else None,
-                    "advisor_web_search": config.REASONING_WEB_SEARCH if config.REASONING_ENABLED else None,
-                    "profile": config.REACHY_MINI_CUSTOM_PROFILE,
-                },
+                condition=condition,
             )
             self.experiment_log.listener = self._recorder.log_event
             self.experiment_log.record(
@@ -376,40 +390,40 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         async with self._instruction_lock:
             if self.connection is None:
                 return False
-            advice_id = self._reasoner.advice_id if self._reasoner is not None else 0
+            reasoner = self._reasoner
+            research_id = (reasoner.followup_id or reasoner.advice_id) if reasoner is not None else 0
+            correction_id = reasoner.correction_id if reasoner is not None else 0
+            instructions = self._get_live_instructions()
             await self.connection.session.update(
                 session=RealtimeSessionCreateRequestParam(
                     type="realtime",
-                    instructions=self._get_live_instructions(),
+                    instructions=instructions,
                     tools=to_realtime_tools_config(self._conversation_tool_specs(get_tool_specs())),
                 ),
             )
-            self._published_advice_id = advice_id
-            self._published_correction_id = self._reasoner.correction_id if self._reasoner is not None else 0
-            logger.info("Refreshed session instructions: research_id=%d", advice_id)
+            self._published_research_id = research_id
+            self._published_correction_id = correction_id
+            self._instructions_sha256 = sha256(instructions.encode("utf-8")).hexdigest()
+            logger.info("Refreshed session instructions: research_id=%d", research_id)
             return True
 
     async def _publish_research(self) -> bool:
         sent = await self.refresh_instructions()
         self._mark_activity("research_updated")
         reasoner = self._reasoner
-        if self._research_followup_task is not None:
-            self._research_followup_task.cancel()
-            await asyncio.gather(self._research_followup_task, return_exceptions=True)
-            self._research_followup_task = None
-        if (
-            sent
-            and reasoner is not None
-            and reasoner.advice_id
-            and reasoner.advice_delivery_turn == reasoner.delivery_turn
-            and reasoner.research_status["snippets"]
-        ):
-            self._research_followup_task = asyncio.create_task(
-                self._resume_after_research(reasoner.advice_id, reasoner.delivery_turn, self._user_speech_serial),
-                name="research-followup",
-            )
+        followup_id = reasoner.followup_id if reasoner is not None else 0
+        if sent and followup_id != self._research_followup_id:
+            if self._research_followup_task is not None:
+                self._research_followup_task.cancel()
+                await asyncio.gather(self._research_followup_task, return_exceptions=True)
+                self._research_followup_task = None
+            self._research_followup_id = followup_id
+            if followup_id:
+                self._research_followup_task = asyncio.create_task(
+                    self._resume_after_research(followup_id), name="research-followup"
+                )
         correction_id = reasoner.correction_id if reasoner is not None else 0
-        if sent and correction_id and correction_id != self._correction_followup_id:
+        if sent and correction_id and correction_id != followup_id and correction_id != self._correction_followup_id:
             if self._correction_followup_task is not None:
                 self._correction_followup_task.cancel()
             self._correction_followup_id = correction_id
@@ -419,11 +433,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         return sent
 
     async def _resume_for_correction(self, correction_id: int) -> None:
-        """Speak a correction at the next quiet moment, even after short replies like "hmm".
-
-        If the student starts a real turn first, the correction is still in the instructions and
-        is said at the start of that reply; this task then ends because it has been consumed.
-        """
         while self.connection is not None and self._reasoner is not None:
             if self._reasoner.correction_id != correction_id:
                 return
@@ -440,17 +449,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 return
             await asyncio.sleep(0.1)
 
-    async def _resume_after_research(self, advice_id: int, user_turn: int, speech_serial: int) -> None:
+    async def _resume_after_research(self, research_id: int) -> None:
         while self.connection is not None and self._reasoner is not None:
-            if self._reasoner.advice_id != advice_id or self._reasoner.delivery_turn != user_turn:
+            if self._reasoner.followup_id != research_id:
                 return
-            if self._user_speech_serial != speech_serial and not self._user_speaking:
-                # Detected speech that did not become a transcribed user turn (noise, echo).
-                # A real turn changes user_turn above; otherwise keep waiting for quiet.
-                speech_serial = self._user_speech_serial
             if (
                 not self._user_speaking
-                and self._user_speech_serial == speech_serial
                 and self._response_done_event.is_set()
                 and not self._in_flight_tool_calls
                 and self._pending_responses.empty()
@@ -459,9 +463,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 >= max(self.playback_until, self.last_conversation_activity_time) + _RESEARCH_QUIET_SECONDS
             ):
                 await self._safe_response_create(
-                    _research_id=advice_id,
-                    _research_turn=user_turn,
-                    _research_speech=speech_serial,
+                    _research_id=research_id,
+                    _research_speech=self._user_speech_serial,
                 )
                 return
             await asyncio.sleep(0.1)
@@ -627,7 +630,16 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             },
         )
         self._mark_activity("say")
-        self.experiment_log.record("input", {"role": "operator", "text": text})
+        self._turn_id += 1
+        self._turn_input_mode = "text"
+        self._turn_user_done_at = time.perf_counter()
+        self._turn_response_created_at = None
+        self._turn_first_audio_at = None
+        self.experiment_log.record(
+            "input", {"role": "operator", "text": text, "turn_id": self._turn_id, "input_mode": "text"}
+        )
+        if self._reasoner is not None:
+            self._reasoner.observe("user", text)
         await self._safe_response_create()
 
     async def _send_startup_greeting_prompt(self) -> None:
@@ -691,7 +703,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     break
 
             research_id = kwargs.pop("_research_id", 0)
-            research_turn = kwargs.pop("_research_turn", 0)
             research_speech = kwargs.pop("_research_speech", 0)
             correction_id = kwargs.pop("_correction_id", 0)
             sent = False
@@ -711,34 +722,34 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     break
 
                 if research_id:
-                    if (
-                        self._reasoner is None
-                        or self._reasoner.advice_id != research_id
-                        or self._reasoner.delivery_turn != research_turn
-                        or self._user_speech_serial != research_speech
-                        or self._user_speaking
-                    ):
+                    if self._reasoner is None or self._reasoner.followup_id != research_id:
+                        break
+                    if self._user_speech_serial != research_speech or self._user_speaking:
+                        self._research_followup_task = asyncio.create_task(
+                            self._resume_after_research(research_id), name="research-followup"
+                        )
                         break
                     kwargs = {
                         "response": {
                             "instructions": self._get_live_instructions()
-                            + "\nContinue the unresolved research question naturally in one or two sentences. "
-                            "Connect the finding to what the student described. Do not announce a report or repeat a question.",
+                            + "\nA background lookup has finished. Check the latest conversation before speaking. "
+                            "Say any required correction first, even if the topic changed. For the remaining finding, "
+                            "if the student moved on, declined the result, or already has the answer, stay silent. "
+                            "Otherwise connect the finding to their latest comments in one or two sentences, "
+                            "without repeating the correction. If research is unavailable, briefly say you "
+                            "could not verify it; do not guess or claim a result. Do not repeat an acknowledgement, "
+                            "announce a report, or start another lookup.",
                             "tool_choice": "none",
                         }
                     }
                     logger.info("Research continuation queued for speech: research_id=%d", research_id)
                 elif correction_id:
-                    if (
-                        self._reasoner is None
-                        or self._reasoner.correction_id != correction_id
-                        or self._user_speaking
-                    ):
+                    if self._reasoner is None or self._reasoner.correction_id != correction_id or self._user_speaking:
                         break
                     kwargs = {
                         "response": {
                             "instructions": self._get_live_instructions()
-                            + "\nSay the correction now, in one or two sentences, starting with \"Correction:\". "
+                            + '\nSay the correction now, in one or two sentences, starting with "Correction:". '
                             "State the right fact or that it is unknown. Do not add anything else.",
                             "tool_choice": "none",
                         }
@@ -933,20 +944,18 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             connect_kwargs["extra_query"] = self._realtime_connect_query
         async with self.client.realtime.connect(**connect_kwargs) as conn:
             self.experiment_log.session_id = uuid.uuid4().hex
-            self._start_session_recording()
             self._assistant_text.clear()
             self._user_speaking = False
-            self.experiment_log.record(
-                "session_start",
-                {
-                    "backend": "huggingface",
-                    "profile": config.REACHY_MINI_CUSTOM_PROFILE,
-                    "voice": self.get_current_voice(),
-                },
-            )
+            self._turn_id = 0
+            self._audio_input_turn_ids.clear()
+            self._response_turn_id = None
+            self._turn_user_done_at = None
+            self._turn_response_created_at = None
+            self._turn_first_audio_at = None
             try:
                 session_config = self._get_session_config(tool_specs)
                 await conn.session.update(session=session_config)
+                self._instructions_sha256 = sha256(session_config["instructions"].encode("utf-8")).hexdigest()
                 logger.info(
                     "Realtime session initialized with profile=%r voice=%r",
                     getattr(config, "REACHY_MINI_CUSTOM_PROFILE", None),
@@ -974,6 +983,77 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 self.deps.request_research = self._reasoner.request if self._reasoner is not None else None
                 if self._reasoner is not None:
                     await self.refresh_instructions()
+                requested_profile = config.REACHY_MINI_CUSTOM_PROFILE or DEFAULT_PROFILE_NAME
+                effective_profile: str | None = requested_profile
+                try:
+                    read_profile(config.REACHY_MINI_CUSTOM_PROFILE)
+                except (FileNotFoundError, ProfileFormatError) as exc:
+                    logger.warning("Recording profile fallback for %s: %s", requested_profile, exc)
+                    effective_profile = DEFAULT_PROFILE_NAME
+                    try:
+                        read_packaged_default_profile()
+                    except (FileNotFoundError, ProfileFormatError) as fallback_exc:
+                        logger.warning("Could not identify the effective profile: %s", fallback_exc)
+                        effective_profile = None
+                source_paths: dict[str, Path] = {"realtime_implementation": Path(__file__)}
+                if self._reasoner is not None:
+                    source_paths["reasoning_implementation"] = Path(__file__).with_name("background_reasoning.py")
+                if effective_profile is not None:
+                    profile_directory = (
+                        DEFAULT_PROFILES_DIRECTORY / DEFAULT_PROFILE_NAME
+                        if effective_profile == DEFAULT_PROFILE_NAME
+                        else config.resolve_profile_dir(effective_profile)
+                    )
+                    source_paths["profile"] = profile_directory / PROFILE_FILENAME
+                for source_name, filename in (
+                    ("grounding", config.GROUNDING_FILE),
+                    ("reasoning_grounding", config.REASONING_GROUNDING_FILE if self._reasoner is not None else None),
+                ):
+                    if filename:
+                        source_path = Path(filename).expanduser()
+                        source_paths[source_name] = (
+                            source_path if source_path.is_absolute() else PROJECT_ROOT / source_path
+                        )
+                source_hashes: dict[str, str | None] = {}
+                for source_name, source_path in source_paths.items():
+                    try:
+                        source_hashes[source_name] = sha256(source_path.read_bytes()).hexdigest()
+                    except OSError as exc:
+                        logger.warning("Could not fingerprint %s: %s", source_name, exc)
+                        source_hashes[source_name] = None
+                package_versions: dict[str, str | None] = {}
+                for package_name in ("reachy_mini_conversation_app", "reachy-mini", "openai", "anthropic"):
+                    try:
+                        package_versions[package_name] = version(package_name)
+                    except PackageNotFoundError:
+                        logger.warning("No installed version metadata for %s", package_name)
+                        package_versions[package_name] = None
+                condition: dict[str, object] = {
+                    "backend": "huggingface",
+                    "connection_mode": config.HF_REALTIME_CONNECTION_MODE,
+                    "label": (os.getenv(LABEL_ENV) or "").strip(),
+                    "profile_requested": requested_profile,
+                    "profile": effective_profile,
+                    "voice": self.get_current_voice(),
+                    "advisor_requested": config.REASONING_ENABLED,
+                    "advisor": "on" if self._reasoner is not None else "off",
+                    "advisor_model": self._reasoner.research_status["model"] if self._reasoner is not None else None,
+                    "advisor_effort": config.REASONING_EFFORT if self._reasoner is not None else None,
+                    "advisor_web_search": (
+                        self._reasoner.research_status["web_search_enabled"] if self._reasoner is not None else None
+                    ),
+                    "memory_enabled": config.MEMORY_ENABLED,
+                    "camera_enabled": self.deps.camera_enabled,
+                    "recording_requested": config.SESSION_RECORDING,
+                    "recording_enabled": config.SESSION_RECORDING,
+                    "tools": [spec["name"] for spec in self._conversation_tool_specs(tool_specs)],
+                    "package_versions": package_versions,
+                    "source_sha256": source_hashes,
+                    "instructions_sha256": self._instructions_sha256,
+                }
+                self._start_session_recording(condition)
+                condition["recording_enabled"] = self._recorder is not None
+                self.experiment_log.record("session_start", condition)
                 self.experiment_log.record("research_tool_available", {"enabled": self._reasoner is not None})
                 self._mark_activity("research_updated")
 
@@ -986,12 +1066,23 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                 async for event in self.connection:
                     logger.debug("Realtime event: %s", event.type)
+                    if event.type in {"session.created", "session.updated"} and event.session.type == "realtime":
+                        reported_voice = None
+                        if event.session.audio is not None and event.session.audio.output is not None:
+                            reported_voice = event.session.audio.output.voice
+                        self.experiment_log.record(
+                            "voice_session",
+                            {"source_event": event.type, "model": event.session.model, "voice": reported_voice},
+                        )
                     if event.type == "input_audio_buffer.speech_started":
                         self._mark_activity("user_speech_started")
                         self._user_speaking = True
                         self._user_speech_serial += 1
+                        self._turn_id += 1
+                        self._audio_input_turn_ids[event.item_id] = self._turn_id
+                        self._turn_input_mode = "audio"
                         self._response_interrupted = True
-                        self.experiment_log.record("speech_started", {})
+                        self.experiment_log.record("speech_started", {"turn_id": self._turn_id})
                         self._turn_user_done_at = None
                         self._turn_response_created_at = None
                         self._turn_first_audio_at = None
@@ -1022,18 +1113,26 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                     if event.type == "response.created":
                         self._mark_activity("response_created")
-                        self._response_advice_id = self._published_advice_id
+                        self._response_research_id = self._published_research_id
                         self._response_correction_id = self._published_correction_id
                         self._response_had_audio = False
                         self._response_interrupted = False
-                        self.experiment_log.record("response_started", {"research_id": self._response_advice_id})
+                        self._response_turn_id = self._turn_id or None
+                        self.experiment_log.record(
+                            "response_started",
+                            {"research_id": self._response_research_id, "turn_id": self._response_turn_id},
+                        )
                         self.deps.movement_manager.set_speaking(True)
                         self._response_done_event.clear()
                         self._response_started_or_rejected_event.set()
                         if self._turn_user_done_at is not None and self._turn_response_created_at is None:
                             self._turn_response_created_at = time.perf_counter()
                             delta_ms = (self._turn_response_created_at - self._turn_user_done_at) * 1000
-                            logger.info("Turn latency: response.created %.0f ms after user transcript", delta_ms)
+                            logger.info(
+                                "Turn latency: response.created %.0f ms after %s input",
+                                delta_ms,
+                                self._turn_input_mode,
+                            )
                         logger.debug("Response created (active)")
 
                     if event.type == "response.done":
@@ -1048,7 +1147,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                                 "text": "\n".join(self._assistant_text.values()),
                                 "status": event.response.status,
                                 "interrupted": self._response_interrupted,
-                                "research_id": self._response_advice_id,
+                                "research_id": self._response_research_id,
+                                "turn_id": self._response_turn_id,
                             },
                         )
                         self._assistant_text.clear()
@@ -1058,7 +1158,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             and not self._response_interrupted
                             and event.response.status == "completed"
                         ):
-                            self._reasoner.consume(self._response_advice_id)
+                            self._reasoner.consume(self._response_research_id)
                             self._reasoner.consume_correction(self._response_correction_id)
                         logger.debug("Response done")
 
@@ -1084,6 +1184,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                     # Handle completed transcription (user finished speaking)
                     if event.type == "conversation.item.input_audio_transcription.completed":
+                        transcript_completed_at = time.perf_counter()
                         self._mark_activity("user_transcription_completed")
                         self._user_speaking = False
                         raw_transcript = event.transcript or ""
@@ -1094,18 +1195,28 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         await self._cancel_partial_transcript_task()
 
                         if not transcript:
+                            self._audio_input_turn_ids.pop(event.item_id, None)
                             logger.debug("Ignoring empty user transcript")
                             continue
 
-                        self._turn_user_done_at = time.perf_counter()
-                        self._turn_response_created_at = None
-                        self._turn_first_audio_at = None
+                        input_turn_id = self._audio_input_turn_ids.pop(event.item_id, None)
+                        if input_turn_id is None:
+                            self._turn_id += 1
+                            input_turn_id = self._turn_id
+                            self._turn_first_audio_at = None
+                        if input_turn_id == self._turn_id:
+                            self._turn_user_done_at = transcript_completed_at
+                            self._turn_input_mode = "audio"
+                            self._turn_response_created_at = None
                         self._in_flight_tool_calls.clear()
                         self._tool_batch_needs_response = False
 
                         await self.output_queue.put(AdditionalOutputs({"role": "user", "content": transcript}))
                         self._emit_transcript("user", transcript, True)
-                        self.experiment_log.record("input", {"role": "user", "text": transcript})
+                        self.experiment_log.record(
+                            "input",
+                            {"role": "user", "text": transcript, "turn_id": input_turn_id, "input_mode": "audio"},
+                        )
                         if self._reasoner is not None:
                             self._reasoner.observe("user", transcript)
 
@@ -1127,10 +1238,38 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         decoded_pcm_bytes = base64.b64decode(event.delta)
                         decoded_pcm = np.frombuffer(decoded_pcm_bytes, dtype=np.int16).reshape(1, -1)
                         self._mark_activity("assistant_audio_delta")
-                        if self._turn_user_done_at is not None and self._turn_first_audio_at is None:
+                        if (
+                            self._turn_first_audio_at is None
+                            and self._response_turn_id == self._turn_id
+                            and self._turn_id
+                        ):
                             self._turn_first_audio_at = time.perf_counter()
-                            delta_ms = (self._turn_first_audio_at - self._turn_user_done_at) * 1000
-                            logger.info("Turn latency: first audio delta %.0f ms after user transcript", delta_ms)
+                            first_audio_latency_ms: float | None = None
+                            if self._turn_user_done_at is not None:
+                                first_audio_latency_ms = (self._turn_first_audio_at - self._turn_user_done_at) * 1000
+                                logger.info(
+                                    "Turn latency: first audio delta %.0f ms after %s input",
+                                    first_audio_latency_ms,
+                                    self._turn_input_mode,
+                                )
+                            self.experiment_log.record(
+                                "first_audio_generated",
+                                {
+                                    "turn_id": self._turn_id,
+                                    "elapsed_ms": (
+                                        round(first_audio_latency_ms, 3)
+                                        if first_audio_latency_ms is not None
+                                        else None
+                                    ),
+                                    "input_mode": self._turn_input_mode,
+                                    "measurement": "client_received_audio_delta",
+                                    "timing_status": (
+                                        "measured"
+                                        if first_audio_latency_ms is not None
+                                        else "input_completion_not_yet_observed"
+                                    ),
+                                },
+                            )
                         if self._recorder is not None:
                             self._recorder.record_assistant(self.SAMPLE_RATE, decoded_pcm)
                         await self.output_queue.put(
@@ -1226,7 +1365,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             finally:
                 if self._assistant_text:
                     self.experiment_log.record(
-                        "response", {"text": "\n".join(self._assistant_text.values()), "status": "disconnected"}
+                        "response",
+                        {
+                            "text": "\n".join(self._assistant_text.values()),
+                            "status": "disconnected",
+                            "turn_id": self._response_turn_id,
+                        },
                     )
                     self._assistant_text.clear()
                 self.deps.request_research = None
@@ -1239,7 +1383,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     await asyncio.gather(self._correction_followup_task, return_exceptions=True)
                     self._correction_followup_task = None
                 self._correction_followup_id = 0
-                self._published_advice_id = 0
+                self._research_followup_id = 0
+                self._published_research_id = 0
                 self._published_correction_id = 0
                 if self._reasoner is not None:
                     await self._reasoner.close()
@@ -1316,7 +1461,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             await asyncio.gather(self._correction_followup_task, return_exceptions=True)
             self._correction_followup_task = None
         self._correction_followup_id = 0
-        self._published_advice_id = 0
+        self._research_followup_id = 0
+        self._published_research_id = 0
         self._published_correction_id = 0
         if self._reasoner is not None:
             await self._reasoner.close()

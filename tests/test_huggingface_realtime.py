@@ -5,6 +5,7 @@ import base64
 import asyncio
 from types import SimpleNamespace
 from typing import Any
+from hashlib import sha256
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -15,6 +16,7 @@ import reachy_mini_conversation_app.conversation_handler as conv_mod
 import reachy_mini_conversation_app.huggingface_realtime as hf_mod
 from reachy_mini_conversation_app.config import config, get_default_voice, refresh_runtime_config_from_env
 from reachy_mini_conversation_app.streaming import AdditionalOutputs
+from reachy_mini_conversation_app.profile_store import write_profile
 from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
 from reachy_mini_conversation_app.background_reasoning import ReasoningAdvice, BackgroundReasoner
 from reachy_mini_conversation_app.huggingface_realtime import HuggingFaceRealtimeHandler
@@ -1077,7 +1079,7 @@ async def test_research_continuation_waits_for_playback_and_user_speech(monkeypa
             while not worker.advice_id:
                 await asyncio.sleep(0.001)
         handler.playback_until = time.monotonic() + 10
-        task = asyncio.create_task(handler._resume_after_research(worker.advice_id, worker.user_turn, 0))
+        task = asyncio.create_task(handler._resume_after_research(worker.followup_id))
         await asyncio.sleep(0.12)
         assert handler._pending_responses.empty()
         handler.playback_until = 0
@@ -1101,7 +1103,7 @@ async def test_research_continuation_survives_noise_that_never_becomes_a_turn(mo
     """A speech blip with no transcribed user turn delays, but does not cancel, the finding."""
     monkeypatch.setattr(hf_mod, "_RESEARCH_QUIET_SECONDS", 0)
     handler = _plain_handler()
-    handler._reasoner = SimpleNamespace(advice_id=1, user_turn=1, delivery_turn=1, correction_id=0)
+    handler._reasoner = SimpleNamespace(followup_id=1, correction_id=0)
     handler.connection = MagicMock()
     handler._response_done_event.set()
     sent = []
@@ -1112,7 +1114,7 @@ async def test_research_continuation_survives_noise_that_never_becomes_a_turn(mo
     handler._safe_response_create = fake_create  # type: ignore[method-assign]
     handler._user_speaking = True
     handler._user_speech_serial = 1
-    task = asyncio.create_task(handler._resume_after_research(1, 1, 0))
+    task = asyncio.create_task(handler._resume_after_research(1))
     await asyncio.sleep(0.15)
     assert not sent
     handler._user_speaking = False  # blip ended; user_turn unchanged (no transcript)
@@ -1121,35 +1123,43 @@ async def test_research_continuation_survives_noise_that_never_becomes_a_turn(mo
 
 
 @pytest.mark.asyncio
-async def test_research_continuation_is_dropped_when_noise_was_a_real_turn(monkeypatch):
-    """If the detected speech became a transcribed user turn, the old finding is not spoken."""
+async def test_research_continuation_is_dropped_when_request_is_replaced(monkeypatch):
+    """A newer lookup invalidates a queued finding from the previous request."""
     monkeypatch.setattr(hf_mod, "_RESEARCH_QUIET_SECONDS", 0)
     handler = _plain_handler()
-    reasoner = SimpleNamespace(advice_id=1, user_turn=1, delivery_turn=1, correction_id=0)
+    reasoner = SimpleNamespace(followup_id=1, correction_id=0)
     handler._reasoner = reasoner
     handler.connection = MagicMock()
     handler._response_done_event.set()
     handler._safe_response_create = AsyncMock()  # type: ignore[method-assign]
     handler._user_speaking = True
     handler._user_speech_serial = 1
-    task = asyncio.create_task(handler._resume_after_research(1, 1, 0))
+    task = asyncio.create_task(handler._resume_after_research(1))
     await asyncio.sleep(0.15)
-    reasoner.user_turn = 2
-    reasoner.delivery_turn = 2
+    reasoner.followup_id = 2
     handler._user_speaking = False
     await asyncio.wait_for(task, 1)
     handler._safe_response_create.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_queued_research_speech_is_dropped_if_student_starts_a_new_turn(monkeypatch):
-    """The final sender rechecks input after a continuation has already been queued."""
+async def test_queued_research_speech_waits_if_student_starts_a_new_turn(monkeypatch):
+    """New speech defers a queued finding until the student and playback finish."""
+    monkeypatch.setattr(hf_mod, "_RESEARCH_QUIET_SECONDS", 0)
     handler = _plain_handler()
-    handler._reasoner = SimpleNamespace(advice_id=1, user_turn=1, delivery_turn=1, correction_id=0)
+    handler._reasoner = SimpleNamespace(followup_id=1, correction_id=0)
     handler.connection = MagicMock()
-    handler.connection.response.create = AsyncMock()
+    monkeypatch.setattr(handler, "_get_live_instructions", lambda: "Latest conversation")
+    spoken = asyncio.Event()
+
+    async def respond(**kwargs):
+        spoken.set()
+        handler._response_started_or_rejected_event.set()
+        handler._response_done_event.set()
+
+    handler.connection.response.create = AsyncMock(side_effect=respond)
     handler._response_done_event.clear()
-    await handler._safe_response_create(_research_id=1, _research_turn=1, _research_speech=0)
+    await handler._safe_response_create(_research_id=1, _research_speech=0)
     task = asyncio.create_task(handler._response_sender_loop())
     try:
         await asyncio.sleep(0.01)
@@ -1158,14 +1168,32 @@ async def test_queued_research_speech_is_dropped_if_student_starts_a_new_turn(mo
         handler._response_done_event.set()
         await asyncio.sleep(0.01)
         handler.connection.response.create.assert_not_awaited()
+        handler._user_speaking = False
+        await asyncio.wait_for(spoken.wait(), 1)
+        handler.connection.response.create.assert_awaited_once()
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+        if handler._research_followup_task is not None:
+            handler._research_followup_task.cancel()
+            await asyncio.gather(handler._research_followup_task, return_exceptions=True)
 
 
 @pytest.mark.asyncio
-async def test_late_research_is_context_only_without_forcing_an_old_topic(monkeypatch):
-    """A result overtaken by another user turn waits for a relevant natural reply."""
+@pytest.mark.parametrize(
+    "followup,correction",
+    [
+        ("Hmm.", ""),
+        ("Go on.", ""),
+        ("Did you find it?", ""),
+        ("I want shadows that follow people.", ""),
+        ("Let's talk about music instead.", "I invented that project; I could not verify it."),
+    ],
+)
+@pytest.mark.parametrize("failed", [False, True])
+async def test_research_outcome_returns_after_followup_conversation(monkeypatch, followup, correction, failed):
+    """Follow-up conversation preserves delivery of findings and a brief failure recovery."""
+    monkeypatch.setattr(hf_mod, "_RESEARCH_QUIET_SECONDS", 0)
     handler = _plain_handler()
     handler.connection = MagicMock()
     handler.connection.session.update = AsyncMock()
@@ -1179,7 +1207,9 @@ async def test_late_research_is_context_only_without_forcing_an_old_topic(monkey
             content=[
                 SimpleNamespace(
                     type="text",
-                    text=ReasoningAdvice(snippets=["Finding"], next_question="", uncertainty="").model_dump_json(),
+                    text=ReasoningAdvice(
+                        snippets=["Finding"], next_question="", uncertainty="", correction=correction
+                    ).model_dump_json(),
                     citations=None,
                 )
             ],
@@ -1187,18 +1217,43 @@ async def test_late_research_is_context_only_without_forcing_an_old_topic(monkey
     )
     worker = BackgroundReasoner(client, "shop", "model", AsyncMock(return_value=True), debounce_seconds=0)
     handler._reasoner = worker
+    if failed:
+        client.messages.create.side_effect = asyncio.TimeoutError
+    spoken = asyncio.Event()
+
+    async def respond(**kwargs):
+        spoken.set()
+        handler._response_started_or_rejected_event.set()
+        handler._response_done_event.set()
+
+    handler.connection.response.create = AsyncMock(side_effect=respond)
+    sender = asyncio.create_task(handler._response_sender_loop())
     try:
-        worker.observe("user", "First question")
-        worker.request("First question")
-        worker.observe("user", "Actually, a different topic")
+        worker.observe("user", "Find interactive art projects using shadows")
+        worker.request("Find interactive art projects using shadows")
+        worker.observe("user", followup)
         async with asyncio.timeout(1):
-            while not worker.advice_id:
+            while not worker.followup_id:
                 await asyncio.sleep(0.001)
         assert await handler._publish_research()
-        assert handler._research_followup_task is None
-        assert handler._pending_responses.empty()
-        assert "Finding" in handler.connection.session.update.call_args.kwargs["session"]["instructions"]
+        await asyncio.wait_for(spoken.wait(), 1)
+        instructions = handler.connection.response.create.call_args.kwargs["response"]["instructions"]
+        assert ("Research status: unavailable" if failed else "Finding") in instructions
+        assert "stay silent" in instructions
+        assert "could not verify" in instructions
+        if correction and not failed:
+            assert correction in instructions
+            assert handler._correction_followup_task is None
+            assert instructions.index("Say any required correction first") < instructions.index("stay silent")
+        assert await handler._publish_research()
+        await asyncio.sleep(0)
+        handler.connection.response.create.assert_awaited_once()
     finally:
+        sender.cancel()
+        await asyncio.gather(sender, return_exceptions=True)
+        if handler._research_followup_task is not None:
+            handler._research_followup_task.cancel()
+            await asyncio.gather(handler._research_followup_task, return_exceptions=True)
         await worker.close()
 
 
@@ -1227,6 +1282,234 @@ async def test_recording_keeps_user_and_interrupted_partial_response(monkeypatch
     assert [row["text"] for row in replies] == ["Which material?", "I will check that."]
     assert replies[0]["interrupted"] and replies[0]["status"] == "cancelled"
     assert not replies[1]["interrupted"] and replies[1]["status"] == "completed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fallback", [False, True])
+async def test_session_provenance_records_effective_setup_without_audio_recording(tmp_path, monkeypatch, fallback):
+    """Session metadata fingerprints the resolved profile and distinguishes disabled advisor setup."""
+    monkeypatch.setattr(config, "INSTANCE_PATH", tmp_path / "instance")
+    monkeypatch.setattr(config, "PROFILES_DIRECTORY", tmp_path / "unused-profile-root")
+    profile_path = write_profile(
+        "experiment", config.user_personalities_root() / "experiment", "Private profile body", ()
+    )
+    selected_profile = "missing-profile" if fallback else "user_personalities/experiment"
+    monkeypatch.setattr(config, "REACHY_MINI_CUSTOM_PROFILE", selected_profile)
+    monkeypatch.setattr(config, "REASONING_ENABLED", True)
+    monkeypatch.setattr(config, "SESSION_RECORDING", False)
+    monkeypatch.setattr(config, "MEMORY_ENABLED", False)
+    monkeypatch.setattr(config, "CAMERA_ENABLED", True)
+    monkeypatch.setattr(config, "HF_TOKEN", "private-hf-token")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "private-anthropic-key")
+    monkeypatch.setenv("REACHY_MINI_SESSION_LABEL", "latency-off trial 1")
+    grounding = tmp_path / "shop.txt"
+    grounding.write_text("Private shop instructions", encoding="utf-8")
+    monkeypatch.setattr(config, "GROUNDING_FILE", str(grounding))
+    monkeypatch.setattr(hf_mod, "create_background_reasoner", lambda *args, **kwargs: None)
+    monkeypatch.setattr(hf_mod, "version", lambda package: "test-version")
+    recorder = MagicMock()
+    monkeypatch.setattr(hf_mod, "SessionRecorder", recorder)
+    handler = _session_handler(monkeypatch, ())
+    handler._voice_override = "Ryan"
+    await handler._run_realtime_session()
+    rows = [json.loads(line) for line in gzip.decompress(handler.experiment_log.path.read_bytes()).splitlines()]
+    session = next(row for row in rows if row["e"] == "session_start")
+    assert session["label"] == "latency-off trial 1"
+    assert session["profile_requested"] == selected_profile
+    assert session["profile"] == ("default" if fallback else selected_profile)
+    assert session["voice"] == "Ryan"
+    assert session["advisor_requested"] is True and session["advisor"] == "off"
+    assert session["advisor_model"] is None
+    assert session["memory_enabled"] is False and session["camera_enabled"] is False
+    assert session["recording_enabled"] is False
+    assert session["recording_requested"] is False
+    assert session["tools"] == []
+    expected_profile = hf_mod.DEFAULT_PROFILES_DIRECTORY / "default" / "profile.md" if fallback else profile_path
+    assert session["source_sha256"]["profile"] == sha256(expected_profile.read_bytes()).hexdigest()
+    assert session["source_sha256"]["grounding"] == sha256(grounding.read_bytes()).hexdigest()
+    assert session["instructions_sha256"] == sha256(b"test").hexdigest()
+    assert session["package_versions"]["reachy_mini_conversation_app"] == "test-version"
+    encoded = json.dumps(session)
+    for private_value in ("private-hf-token", "private-anthropic-key", "Private profile body", str(tmp_path)):
+        assert private_value not in encoded
+    recorder.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recording_failure", [False, True])
+async def test_recorder_and_experiment_log_record_effective_setup(tmp_path, monkeypatch, recording_failure):
+    """Session metadata distinguishes requested recording from successful recorder setup."""
+    handler = _session_handler(monkeypatch, ())
+    monkeypatch.setattr(config, "REASONING_ENABLED", True)
+    monkeypatch.setattr(config, "SESSION_RECORDING", True)
+    monkeypatch.setattr(config, "REASONING_EFFORT", "medium")
+    monkeypatch.setattr(config, "REASONING_WEB_SEARCH", True)
+    reasoning_grounding = tmp_path / "reasoner.txt"
+    reasoning_grounding.write_text("Research instructions", encoding="utf-8")
+    monkeypatch.setattr(config, "REASONING_GROUNDING_FILE", str(reasoning_grounding))
+    client = MagicMock()
+    client.close = AsyncMock()
+    monkeypatch.setattr(
+        hf_mod,
+        "create_background_reasoner",
+        lambda publish, **kwargs: BackgroundReasoner(client, "test", "effective-model", publish, web_search=False),
+    )
+    recorder = MagicMock()
+    recorder.directory = tmp_path / "recording"
+    constructor = MagicMock(return_value=recorder)
+    if recording_failure:
+        constructor.side_effect = OSError("Recording directory is not writable")
+    monkeypatch.setattr(hf_mod, "SessionRecorder", constructor)
+    await handler._run_realtime_session()
+    rows = [json.loads(line) for line in gzip.decompress(handler.experiment_log.path.read_bytes()).splitlines()]
+    session = next(row for row in rows if row["e"] == "session_start")
+    condition = constructor.call_args.kwargs["condition"]
+    assert all(session[key] == value for key, value in condition.items())
+    assert condition["advisor"] == "on" and condition["advisor_requested"] is True
+    assert condition["advisor_model"] == "effective-model"
+    assert condition["advisor_effort"] == "medium"
+    assert condition["advisor_web_search"] is False
+    assert condition["source_sha256"]["reasoning_grounding"] == sha256(reasoning_grounding.read_bytes()).hexdigest()
+    reasoner_source = Path(hf_mod.__file__).with_name("background_reasoning.py")
+    assert condition["source_sha256"]["reasoning_implementation"] == sha256(reasoner_source.read_bytes()).hexdigest()
+    assert condition["recording_requested"] is True
+    assert condition["recording_enabled"] is (not recording_failure)
+    assert "research_question" in condition["tools"]
+    if recording_failure:
+        recorder.close.assert_not_called()
+    else:
+        recorder.close.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_first_generated_audio_is_recorded_once_per_input_turn(monkeypatch):
+    """Audio chunk arrival is linked to input turns without counting follow-ups as new first responses."""
+    chunk = base64.b64encode(b"\x00\x00").decode()
+    handler = _session_handler(
+        monkeypatch,
+        (
+            _FakeEvent("response.created"),
+            _FakeEvent("response.output_audio.delta", delta=chunk),
+            _FakeEvent("response.done"),
+            _FakeEvent("conversation.item.input_audio_transcription.completed", transcript="First question"),
+            _FakeEvent("response.created"),
+            _FakeEvent("response.output_audio.delta", delta=chunk),
+            _FakeEvent("response.output_audio.delta", delta=chunk),
+            _FakeEvent("response.done"),
+            _FakeEvent("response.created"),
+            _FakeEvent("response.output_audio.delta", delta=chunk),
+            _FakeEvent("response.done"),
+            _FakeEvent("conversation.item.input_audio_transcription.completed", transcript="Second question"),
+            _FakeEvent("response.created"),
+            _FakeEvent("response.output_audio.delta", delta=chunk),
+            _FakeEvent("response.done"),
+        ),
+    )
+    await handler._run_realtime_session()
+    rows = [json.loads(line) for line in gzip.decompress(handler.experiment_log.path.read_bytes()).splitlines()]
+    inputs = [row for row in rows if row["e"] == "input"]
+    timings = [row for row in rows if row["e"] == "first_audio_generated"]
+    assert [row["turn_id"] for row in inputs] == [1, 2]
+    assert [row["turn_id"] for row in timings] == [1, 2]
+    assert all(row["elapsed_ms"] >= 0 and row["input_mode"] == "audio" for row in timings)
+    assert all(row["measurement"] == "client_received_audio_delta" for row in timings)
+    assert [row["turn_id"] for row in rows if row["e"] == "response"] == [None, 1, 1, 2]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("audio_before_transcript", [False, True])
+async def test_generation_timing_handles_delayed_transcription(monkeypatch, audio_before_transcript):
+    """Late transcription preserves turn identity and never makes a later chunk look like first audio."""
+    chunk = base64.b64encode(b"\x00\x00").decode()
+    events = [
+        _FakeEvent("input_audio_buffer.speech_started", item_id="spoken-question"),
+        _FakeEvent("input_audio_buffer.speech_stopped"),
+        _FakeEvent("response.created"),
+    ]
+    if audio_before_transcript:
+        events.append(_FakeEvent("response.output_audio.delta", delta=chunk))
+    events.extend(
+        [
+            _FakeEvent(
+                "conversation.item.input_audio_transcription.completed",
+                item_id="spoken-question",
+                transcript="What makes a useful prototype?",
+            ),
+            _FakeEvent("response.output_audio.delta", delta=chunk),
+            _FakeEvent("response.done"),
+        ]
+    )
+    handler = _session_handler(monkeypatch, tuple(events))
+    await handler._run_realtime_session()
+    rows = [json.loads(line) for line in gzip.decompress(handler.experiment_log.path.read_bytes()).splitlines()]
+    timings = [row for row in rows if row["e"] == "first_audio_generated"]
+    assert len(timings) == 1
+    assert timings[0]["turn_id"] == next(row for row in rows if row["e"] == "input")["turn_id"] == 1
+    assert next(row for row in rows if row["e"] == "response")["turn_id"] == 1
+    if audio_before_transcript:
+        assert timings[0]["elapsed_ms"] is None
+        assert timings[0]["timing_status"] == "input_completion_not_yet_observed"
+    else:
+        assert timings[0]["elapsed_ms"] >= 0
+        assert timings[0]["timing_status"] == "measured"
+
+
+@pytest.mark.asyncio
+async def test_reported_voice_model_is_recorded_without_inventing_a_missing_version(monkeypatch):
+    """Server session metadata records only the model and voice the backend actually reports."""
+    handler = _session_handler(
+        monkeypatch,
+        (
+            _FakeEvent(
+                "session.created",
+                session=SimpleNamespace(type="realtime", model="voice-model-revision", audio=None),
+            ),
+            _FakeEvent(
+                "session.updated",
+                session=SimpleNamespace(
+                    type="realtime", model=None, audio=SimpleNamespace(output=SimpleNamespace(voice="Ryan"))
+                ),
+            ),
+        ),
+    )
+    await handler._run_realtime_session()
+    rows = [json.loads(line) for line in gzip.decompress(handler.experiment_log.path.read_bytes()).splitlines()]
+    reported = [row for row in rows if row["e"] == "voice_session"]
+    assert [row["model"] for row in reported] == ["voice-model-revision", None]
+    assert [row["voice"] for row in reported] == [None, "Ryan"]
+
+
+@pytest.mark.asyncio
+async def test_typed_input_is_timed_and_observed_by_background_research(monkeypatch):
+    """Typed experiment turns carry the same timing and researcher context as completed audio inputs."""
+    handler = _session_handler(
+        monkeypatch,
+        (
+            _FakeEvent("response.created"),
+            _FakeEvent("response.output_audio.delta", delta=base64.b64encode(b"\x00\x00").decode()),
+            _FakeEvent("response.done"),
+        ),
+    )
+    client = MagicMock()
+    client.close = AsyncMock()
+    worker = BackgroundReasoner(client, "test", "model", AsyncMock(return_value=True))
+    observe = MagicMock(wraps=worker.observe)
+    monkeypatch.setattr(worker, "observe", observe)
+    monkeypatch.setattr(hf_mod, "create_background_reasoner", lambda *args, **kwargs: worker)
+
+    async def inject():
+        await handler.say("How should I test the joint?")
+
+    monkeypatch.setattr(handler, "_send_startup_greeting_prompt", inject)
+    await handler._run_realtime_session()
+    rows = [json.loads(line) for line in gzip.decompress(handler.experiment_log.path.read_bytes()).splitlines()]
+    entry = next(row for row in rows if row["e"] == "input")
+    timing = next(row for row in rows if row["e"] == "first_audio_generated")
+    response = next(row for row in rows if row["e"] == "response")
+    assert entry["turn_id"] == timing["turn_id"] == response["turn_id"] == 1
+    assert entry["input_mode"] == timing["input_mode"] == "text"
+    assert timing["elapsed_ms"] >= 0
+    observe.assert_called_once_with("user", "How should I test the joint?")
 
 
 @pytest.mark.asyncio
@@ -1336,7 +1619,7 @@ async def test_correction_is_spoken_after_a_backchannel(monkeypatch):
     """test02 Q3: a correction must still be volunteered after the student says "Hmm."."""
     monkeypatch.setattr(hf_mod, "_RESEARCH_QUIET_SECONDS", 0)
     handler = _plain_handler()
-    reasoner = SimpleNamespace(advice_id=0, user_turn=9, delivery_turn=8, correction_id=5)
+    reasoner = SimpleNamespace(correction_id=5)
     handler._reasoner = reasoner
     handler.connection = MagicMock()
     handler._response_done_event.set()
@@ -1350,7 +1633,7 @@ async def test_correction_followup_stops_once_consumed(monkeypatch):
     """If a reply already carried the correction, the proactive follow-up does not repeat it."""
     monkeypatch.setattr(hf_mod, "_RESEARCH_QUIET_SECONDS", 0)
     handler = _plain_handler()
-    reasoner = SimpleNamespace(advice_id=0, user_turn=1, delivery_turn=1, correction_id=5)
+    reasoner = SimpleNamespace(correction_id=5)
     handler._reasoner = reasoner
     handler.connection = MagicMock()
     handler._user_speaking = True

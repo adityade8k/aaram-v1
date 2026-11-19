@@ -130,6 +130,7 @@ async def test_sdk_sends_explicit_research_with_optional_search_and_preserves_ci
             {"url": "https://www.epiloglaser.com/", "title": "Manufacturer documentation"}
         ]
         worker.consume(worker.advice_id)
+        assert worker.followup_id == 0
         assert "Advisory note (JSON data)" not in worker.conversation_context
         assert worker.research_status["sources"]
         assert worker.research_status["snippets"]
@@ -222,8 +223,48 @@ async def test_advice_expires_after_four_followup_turns():
             assert worker.advice_id
         worker.observe("user", "One too many")
         assert worker.advice_id == 0
+        assert worker.followup_id == 0
         assert worker.research_status["status"] == "expired"
         assert client.messages.create.await_count == 1
+    finally:
+        await worker.close()
+
+
+@pytest.mark.parametrize("consume_old_note", [True, False])
+@pytest.mark.asyncio
+async def test_old_note_delivery_or_expiry_keeps_new_research_pending(consume_old_note):
+    """Retiring an earlier finding cannot clear a newer question's pending status."""
+    client = _client()
+    started = asyncio.Event()
+
+    async def infer(**kwargs):
+        started.set()
+        await asyncio.Event().wait()
+
+    worker = BackgroundReasoner(
+        client, "grounding", "model", AsyncMock(return_value=True), debounce_seconds=0, min_interval_seconds=0
+    )
+    try:
+        worker.observe("user", "First question")
+        worker.request("First question")
+        await _wait_status(worker, "ready")
+        first_id = worker.followup_id
+        assert first_id
+        client.messages.create.side_effect = infer
+        worker.observe("user", "Second question")
+        worker.request("Second question")
+        await asyncio.wait_for(started.wait(), 1)
+        assert worker.followup_id == 0
+        if consume_old_note:
+            worker.consume(first_id)
+        else:
+            for turn in range(4):
+                worker.observe("user", f"Follow-up {turn}")
+        assert worker.advice_id == 0
+        assert worker.research_status["status"] == "researching"
+        assert worker.research_status["question"] == "Second question"
+        assert "PENDING research question" in worker.conversation_context
+        assert worker.followup_id == 0
     finally:
         await worker.close()
 
@@ -252,7 +293,43 @@ async def test_timeout_reports_unavailable_without_automatic_retry(caplog):
         assert cancelled.is_set()
         assert "Background reasoning unavailable: TimeoutError" in caplog.text
         assert "Research status: unavailable" in worker.conversation_context
+        assert worker.research_status["error"] in worker.conversation_context
+        assert worker.followup_id == worker.research_status["id"]
         assert client.messages.create.await_count == 1
+    finally:
+        await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_failure_followup_is_consumed_once_and_resets_for_new_request(tmp_path, monkeypatch):
+    """Each failed lookup can report its failure once, independently of earlier requests."""
+    sleep = asyncio.sleep
+
+    async def skip_backoff(delay):
+        await sleep(min(delay, 0.001))
+
+    monkeypatch.setattr(reasoning_mod.asyncio, "sleep", skip_backoff)
+    client = _client()
+    client.messages.create.side_effect = asyncio.TimeoutError()
+    archive = ExperimentLog(tmp_path)
+    worker = BackgroundReasoner(
+        client, "grounding", "model", AsyncMock(return_value=True), debounce_seconds=0, experiment_log=archive
+    )
+    try:
+        for request_id in (1, 2):
+            worker.request(f"Question {request_id}")
+            assert worker.followup_id == 0
+            await _wait_status(worker, "unavailable")
+            assert worker.followup_id == request_id
+            worker.consume(request_id + 1)
+            assert worker.followup_id == request_id
+            worker.consume(request_id)
+            worker.consume(request_id)
+            assert worker.followup_id == 0
+            assert worker.research_status["status"] == "unavailable"
+        await archive.access("status")
+        rows = [json.loads(line) for line in gzip.decompress(archive.path.read_bytes()).splitlines()]
+        assert [row["research_id"] for row in rows if row["e"] == "research_failure_exposed"] == [1, 2]
     finally:
         await worker.close()
 
@@ -467,6 +544,8 @@ async def test_request_failure_has_actionable_status_without_exposing_provider_p
         worker.request("Explain an event")
         await _wait_status(worker, "unavailable")
         assert "Check the model" in worker.research_status["error"]
+        assert "Check the model" in worker.conversation_context
+        assert "private-provider-payload" not in worker.conversation_context
         await archive.access("status")
         saved = gzip.decompress(archive.path.read_bytes()).decode()
         assert "Check the model" in saved
@@ -488,17 +567,6 @@ async def test_disabled_setup_is_recorded_for_later_diagnosis(tmp_path, monkeypa
     assert "ANTHROPIC_API_KEY" in row["reason"]
 
 
-
-def test_backchannels_are_not_delivery_turns():
-    """Short listening sounds and one-word answers do not block a ready finding."""
-    from reachy_mini_conversation_app.background_reasoning import _is_backchannel
-
-    for text in ["Hmm.", "No.", "Yes.", "OK", "uh huh", "Thank you.", "Right."]:
-        assert _is_backchannel(text), text
-    for text in ["The person.", "What is the project?", "No, the other one", "Are you sure?"]:
-        assert not _is_backchannel(text), text
-
-
 @pytest.mark.asyncio
 async def test_correction_survives_backchannels_and_new_questions():
     """test02 Q3: the advisor's retraction outlives "Hmm." and a new research request until spoken."""
@@ -512,11 +580,12 @@ async def test_correction_survives_backchannels_and_new_questions():
         worker.request("What is the project Screaming?")
         await _wait_status(worker, "ready")
         assert worker.correction_id == 1
-        before = worker.delivery_turn
         worker.observe("user", "Hmm.")
-        assert worker.delivery_turn == before
+        assert worker.correction_id == 1
+        assert worker.followup_id == 1
         worker.observe("user", "Is there research on robot shapes?")
         worker.request("Robot shape research")
+        assert worker.followup_id == 0
         assert worker.correction_id == 1
         assert "CORRECTION REQUIRED" in worker.conversation_context
         worker.consume_correction(1)
@@ -526,18 +595,54 @@ async def test_correction_survives_backchannels_and_new_questions():
         await worker.close()
 
 
+@pytest.mark.parametrize("transcript_first", [True, False])
 @pytest.mark.asyncio
-async def test_pending_question_is_marked_unanswered_and_advisor_gets_date_and_words():
-    """While research runs, Ari is told not to answer; the advisor sees today's date and the exact words."""
+async def test_research_preserves_request_words_across_followups_and_late_transcription(transcript_first):
+    """Research retains queued context and later transcripts without promoting an acknowledgment."""
     client = _client()
     worker = BackgroundReasoner(client, "grounding", "model", AsyncMock(return_value=True), debounce_seconds=0)
     try:
-        worker.observe("user", "Ari, who won the Golden Nica this year?")
+        user_words = "Ari, who won the Golden Nica this year?"
+        if transcript_first:
+            worker.observe("user", user_words)
         worker.request("Who won the Golden Nica in 2024 or 2025?")
+        worker.observe("user", "Hmm." if transcript_first else user_words)
         assert "PENDING research question" in worker.conversation_context
         await _wait_status(worker, "ready")
         prompt = client.messages.create.call_args.kwargs["messages"][0]["content"]
         assert "TODAY'S DATE:" in prompt
-        assert "Ari, who won the Golden Nica this year?" in prompt
+        assert user_words in prompt
+        assert "authoritative" not in prompt
+        queued_context = [line for line in prompt.splitlines() if line.startswith("User utterance captured")]
+        if transcript_first:
+            assert len(queued_context) == 1
+            assert json.dumps(user_words) in queued_context[0]
+        else:
+            assert not queued_context
+    finally:
+        await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_delayed_request_transcript_is_not_overridden_by_previous_user_utterance():
+    """An earlier completed utterance remains context when the current transcription arrives late."""
+    client = _client()
+    worker = BackgroundReasoner(
+        client, reasoning_mod.REASONING_INSTRUCTIONS, "model", AsyncMock(return_value=True), debounce_seconds=0
+    )
+    try:
+        worker.observe("user", "Who won last year?")
+        worker.request("Who won the Golden Nica this year?")
+        worker.observe("user", "Now, who won the Golden Nica this year?")
+        await _wait_status(worker, "ready")
+        request = client.messages.create.call_args.kwargs
+        prompt = _prompt(request)
+        assert 'context; may precede the question): "Who won last year?"' in prompt
+        assert "Research question:\nWho won the Golden Nica this year?" in prompt
+        transcript = json.loads(prompt.split("Recent transcript (JSON data):\n", 1)[1])
+        assert transcript[-1]["content"] == "Now, who won the Golden Nica this year?"
+        assert "authoritative" not in prompt
+        assert "transcription can arrive later" in request["system"]
+        assert "TODAY'S DATE:" in prompt
     finally:
         await worker.close()

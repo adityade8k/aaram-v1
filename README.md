@@ -225,28 +225,31 @@ document still prevents an ungrounded voice session from starting.
 
 #### Conversation flow
 
-1. The voice model handles small talk and established shop facts directly. For a
-   substantive question beyond the local documents, uncertainty, or a complex
-   question, `research_question` queues work and returns immediately.
-2. Ari acknowledges the actual question and may offer a known fact or one useful
-   clarification while the advisor works. A clear question does not need a
-   clarification before research starts. Ari should not redirect general topics
-   to laser cutting, repeat waiting announcements, or manufacture conversation.
+1. The voice model handles small talk, established facts, and brainstorming directly.
+   For uncertain specifics, current facts, explicit lookups, or explanations needing
+   research and synthesis, `research_question` queues work and returns immediately.
+2. Ari acknowledges the lookup once and keeps responding to the student's actual
+   comments while the advisor works. Established context, explicitly framed
+   brainstorming, and occasional situational humor keep the exchange natural.
+   Questions should be useful, not fill silence; a clear question needs no
+   clarification before research starts. Ari must not invent facts or sources,
+   claim unfinished research is verified, or repeat waiting announcements.
 3. The advisor can search sources appropriate to any topic. The voice tool sets
    `search_web=true` for explicit lookups, current information, or requested
    sources; this requires a web-search call when search is enabled. Other requests
    allow the advisor to choose whether to search. A materially changed question
    replaces and cancels the previous request. Identical requests within a user
    turn are deduplicated.
-4. Results update the voice instructions without interrupting a response. If the
-   student has not started another turn, Ari can continue after the active response,
-   estimated queued speaker audio, and a two-second quiet interval. The final sender
+4. Results remain available across follow-up turns and update the voice instructions
+   without interrupting a response. Ari can continue after the active response,
+   estimated queued speaker audio, and a 0.75-second quiet interval. The final sender
    checks again for new speech before sending that continuation.
-5. If another user turn has already occurred, the note stays available for a relevant
-   natural reply, without forcing a return to the old topic. The model must check
-   relevance against the latest conversation. Notes expire after more than four
-   further user turns. A completed audio response that had access to a note consumes
-   it; this records exposure, not proof that the model used it.
+5. Before speaking a finding, the voice model checks its relevance to the latest
+   conversation. It can connect the answer to new details or remain silent if the
+   topic is obsolete or resolved. A correction to Ari's earlier claim takes priority.
+   Ordinary notes expire after more than four further user turns. A completed audio
+   response that had access to a note consumes it; this records exposure, not proof
+   that the model used it.
 
 While the advisor is available, the voice session replaces its bundled direct web
 and knowledge lookup tools with the immediate research handoff. Robot tools keep
@@ -254,16 +257,20 @@ working. If the advisor is disabled, the original lookup tools remain available.
 The conversation screen shows **Research ready**, **Research running**, and
 **Research complete · web searched** (or **no web search used**), plus the model
 and actionable errors. The completed status counts actual search calls, even
-when the response contains no citation. Clickable citations come from API
-annotations. Status and source links are also available through `conversation.research`.
+when the response contains no citation. Source links come from cited API annotations
+or, when none are available, actual web search results. A returned search link does
+not establish that the advisor cited or relied on it. Status and source links are
+also available through `conversation.research`.
 They are not read aloud. The live reference panel covers the current session;
 the experiment archive retains research results and citations across sessions.
 
 The worker batches requests for 0.75 seconds, starts requests at least five seconds
 apart, and runs one inference at a time. It sends at most 24 utterances and 24,000
 transcript characters, capped at 4,000 characters per utterance. Each inference
-has a 45-second timeout and a 6,000-token output cap including reasoning. Failures
-leave conversation running and publish an unavailable state. A new explicit request
+has a 45-second timeout and an 8,000-token output cap including reasoning. Failures
+leave conversation running and publish an unavailable state. At a quiet pause, Ari
+can briefly explain that the lookup failed if the question is still relevant,
+without claiming a verified answer. A new explicit request
 can retry after a minimum 15-second cooldown; there is no automatic paid retry loop.
 The result contains at most two 600-character snippets, one next question, and uncertainty.
 
@@ -424,7 +431,7 @@ Keep the robot service running.
 Paste these commands into Terminal:
 
 ```bash
-cd "/Users/adityade/Documents/ITP/Aaram/version 1"
+cd /path/to/aaram-v1
 source .venv/bin/activate
 reachy-mini-conversation-app --no-camera --ui
 ```
@@ -448,6 +455,80 @@ same commands continues adding to the existing experiment archive.
 If the command is missing, activate `.venv` and check the installation steps. A
 robot connection `TimeoutError` usually means the robot service is unavailable.
 If port `7860` is already in use, stop the earlier app instance before relaunching.
+
+### Author-operated paper experiments
+
+The Ari profile implements five flexible teaching modes: Tell, Guide, Ask, Offer,
+and Hand over. Missing prerequisites receive explanation or options immediately;
+the student need not fail two questions first. Handoffs summarize the project,
+what is known or tried, and the question for staff without inventing missing details.
+Safety rules, staff approvals, and the existing motion limits still apply.
+
+Use the same checkout on each Mac. Install its locked environment with `uv sync --frozen`
+and activate `.venv`. Keep credentials in each Mac's own ignored `.env`; the advisor
+uses `ANTHROPIC_API_KEY`, while voice uses the Hugging Face connection. The OpenAI key
+is not needed for this advisor. Start and connect the Reachy daemon before launching
+a trial, and stop any other conversation instance. The launcher does not install or
+start the daemon, grant macOS permissions, or move the robot during a dry run.
+
+```bash
+python -m benchmarks.ari_study.launch --experiment latency --condition on --dry-run
+python -m benchmarks.ari_study.launch --experiment latency --condition on --case lookup-01 --repetition 1
+```
+
+Use `--condition off` for conversation-only, and select `--experiment safety` or
+`--experiment teaching` for the other tests. `--voice` fixes a supported voice;
+use the same voice in comparisons. Each launch creates a fresh instance under
+`recordings/paper/<trial-id>/`, forces Ari, disables long-term memory and camera
+tools/recording, and records speech and transcripts. `--output` changes the local
+recordings root; paths are resolved independently on each Mac. Only operate these
+recorded author tests where nearby people know speech may be processed and recorded.
+The physical visor does not control microphone processing or retention.
+
+`trial.json` records the requested condition without credentials. The session's
+`meta.json` and `session_start` log event record the effective profile, voice,
+advisor setup, memory/camera settings, installed package versions, and source/prompt
+hashes. Check requested versus actual advisor state before accepting an ON trial.
+Record the voice service's reported model version when available; a client package
+version alone does not pin the hosted conversation model. Changing prompts during
+collection produces a new configuration, not additional runs of the old one.
+
+- **Safety:** the existing 65 cases are in `benchmarks/ari_safety/cases.json`.
+  `python -m benchmarks.ari_safety.coverage` checks rule coverage. The live runner
+  `python -m benchmarks.ari_safety.run --url ws://127.0.0.1:7860/rpc --repeats 3`
+  sends typed prompts. It runs cases in one session, so report that context carryover;
+  for isolated cases, launch fresh and use `--only <case-id> --repeats 1`.
+  Word checks are screening results. Human review must distinguish incomplete
+  responses from critical violations and retain unanswered attempts.
+- **Latency:** deliver the same authored request in fresh OFF/ON sessions, alternate
+  order across repetitions, and keep voice, input delivery, source availability,
+  hardware and network conditions consistent. OFF uses installed direct lookup tools;
+  ON uses the Anthropic advisor and its search. This compares whole configurations,
+  not identical retrieval implementations. Confirm lookup tools actually loaded.
+- **Teaching:** `benchmarks/ari_teaching/cases.json` contains eight provisional fixed
+  fictional scripts, two per category, plus behavioral criteria and a blank scoring
+  template. Use a fresh trial per script repetition, deliver turns verbatim, and
+  score the actual responses. Three repetitions are a planned protocol, not collected
+  results. Keep failed or mismatched responses rather than improvising a rescue.
+
+Export a completed trial's timing and annotation sheet:
+
+```bash
+python -m benchmarks.ari_study.export recordings/paper/<trial-id>/instance/experiment.jsonl.gz --output recordings/paper/<trial-id>/analysis
+```
+
+`first_audio_generated` measures client receipt of the first audio chunk relative
+to completed transcription or typed input. It is not physical speaker playback.
+If generation precedes completed transcription, the interval is unmeasured rather
+than zero. The exporter retains attempts without audio and leaves useful-answer,
+audible-response, outcome and notes columns for human annotation. Use independently
+observed playback when reporting audible timing; `assistant.wav` records generated
+audio and is not proof that an interrupted chunk was heard. The exported median
+and nearest-rank 95th percentile describe measured generation latency only.
+
+These tools support the paper's author-operated evaluations. They do not implement
+material recognition, visor-position sensing, selective listening, wake/lift controls,
+or measured learning outcomes. No dummy values from the draft are evaluation results.
 
 ### Download data from Terminal
 

@@ -16,6 +16,7 @@ from numpy.typing import NDArray
 
 from reachy_mini_conversation_app.memory import memory_path_for_instance
 
+
 LABEL_ENV = "REACHY_MINI_SESSION_LABEL"
 
 
